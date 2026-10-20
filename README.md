@@ -33,6 +33,8 @@ await phone.call(peer.addr, 1, 2, 1, "run the tests");
 ```
 
 - `call` / `handle` — calls and results; `event` / `onEvent` — events either way.
+- `callOn` / `eventOn` — the same on a stream (one per chat): a loss on one chat does not hold
+  up the others.
 - `addDict` — a compression dictionary; a missing one is fetched from the sender.
 - `befriend` — add a device known from the family book without pairing.
 
