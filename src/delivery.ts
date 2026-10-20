@@ -132,7 +132,9 @@ export class Stream {
   private timeout(p: Part, ahead: number): number {
     let t = this.rto();
     if (this.bw > 0) t += (ahead * maxPart) / this.bw;
-    for (let i = 1; i < p.tries && t < rtoMax; i++) t *= 2;
+    // back off only on congestion, or after three tries in a row: a random loss is no reason
+    const backoff = this.queueing() ? p.tries - 1 : Math.max(0, p.tries - 3);
+    for (let i = 0; i < backoff && t < rtoMax; i++) t *= 2;
     return Math.min(t, rtoMax);
   }
 
@@ -148,13 +150,19 @@ export class Stream {
     this.srtt = (7 * this.srtt + rtt) / 8;
   }
 
+  private queueing(): boolean {
+    return this.srtt > this.minRTT + Math.max(this.minRTT / 2, 10);
+  }
+
   private acked(n: number) {
-    for (let i = 0; i < n; i++) this.cwnd += this.cwnd < this.ssthresh ? 1 : 1 / this.cwnd;
+    const queue = this.queueing(); // slow start, and while no queue builds (as BBR probes)
+    for (let i = 0; i < n; i++) this.cwnd += this.cwnd < this.ssthresh || !queue ? 1 : 1 / this.cwnd;
     this.cwnd = Math.min(this.cwnd, cwndMax);
   }
 
   private lost(now: number) {
-    if (now - this.lastCut < Math.max(this.srtt, rtoMin)) return;
+    // only while a queue builds: a loss without one is random, not congestion
+    if (now - this.lastCut < Math.max(this.srtt, rtoMin) || !this.queueing()) return;
     this.lastCut = now;
     this.ssthresh = Math.max(this.cwnd / 2, cwndMin);
     this.cwnd = this.ssthresh;
@@ -285,9 +293,11 @@ export class Stream {
       pos = p2;
       if (count > 64n) throw new Error("too many ranges");
       let done = 0;
+      let newest = 0; // the latest send time among the parts this ack covers
       const ack = (seq: number) => {
         const p = this.inflight.get(seq);
         if (!p) return;
+        if (p.sent > newest) newest = p.sent;
         this.delivered += p.data.length;
         if (p.tries === 1) {
           this.sample(now - p.sent);
@@ -311,6 +321,17 @@ export class Stream {
         cursor = start + Number(run);
       }
       this.acked(done);
+      if (newest > 0) { // time-based loss detection (RACK): sent well before one that arrived
+        const reorder = Math.max(this.srtt / 4, 1);
+        let lost = false;
+        for (const p of this.inflight.values()) {
+          if (p.sent !== 0 && p.sent + reorder < newest) {
+            p.sent = 0;
+            lost = true;
+          }
+        }
+        if (lost) this.lost(now);
+      }
       if (beyond > 0) { // fast retransmit: three parts past the gap, or a quarter of a round trip
         const gap = this.inflight.get(Number(upto) + 1);
         if (gap && (beyond >= 3 || now - gap.sent >= Math.max(this.srtt / 4, ackDelay))) gap.sent = 0;
