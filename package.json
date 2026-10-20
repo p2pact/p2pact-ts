@@ -1,0 +1,38 @@
+{
+  "name": "p2pact",
+  "version": "0.1.0",
+  "description": "TypeScript implementation of P2PACT \u2014 the P2P Agent Chat Protocol: chat with your AI agents across your own devices, no servers.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "files": [
+    "dist/src"
+  ],
+  "engines": {
+    "node": ">=22.15"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "test": "tsc -p . && node --test dist/test/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/p2pact/p2pact-ts"
+  },
+  "keywords": [
+    "p2p",
+    "ai-agents",
+    "chat",
+    "protocol",
+    "noise",
+    "cbor"
+  ],
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.6.3"
+  },
+  "bin": {
+    "p2pact-interop": "dist/src/interop.js"
+  }
+}
