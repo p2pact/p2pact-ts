@@ -68,6 +68,7 @@ interface EpState {
   ep: Endpoint;
   lastRecv: number;
   lastSend: number;
+  session: number; // our index of the session its last packet belonged to
 }
 
 interface PeerState {
@@ -333,7 +334,7 @@ export class Node {
     s.lastRecv = now;
     if (!this.current.has(s.peer)) this.current.set(s.peer, s);
     const ps = this.peerState(s.peer)!;
-    this.seen(ps, from, now);
+    this.seen(ps, from, now, s.local);
     ps.st.receive(now, plain, (m, z) => this.inbound(s.peer, m, z));
     if (ps.st.ackDue !== 0 && now >= ps.st.ackDue) this.wake();
   }
@@ -356,7 +357,7 @@ export class Node {
     this.sessions.set(local, s);
     this.current.set(peer, s);
     this.handshakes++;
-    this.seen(ps, from, now);
+    this.seen(ps, from, now, s.local);
     this.bootOf(ps, u32(payload, 8));
     from.road.send(from.addr, concat(Uint8Array.of(pResp), be32(s.remote), be32(local), resp));
     if (payload.length > 12) ps.st.receive(now, payload.subarray(12), (m, z) => this.inbound(peer, m, z));
@@ -377,7 +378,7 @@ export class Node {
     this.current.set(h.peer!, s);
     this.handshakes++;
     const ps = this.peerState(h.peer!)!;
-    this.seen(ps, from, now);
+    this.seen(ps, from, now, s.local);
     this.bootOf(ps, u32(payload, 0));
     this.sendInfo(h.peer!);
     for (const e of h.early) this.onData(now, e.pkt, e.from);
@@ -429,7 +430,7 @@ export class Node {
     this.sessions.set(local, s);
     this.current.set(peer, s);
     const ps = this.peerState(peer)!;
-    this.seen(ps, from, now);
+    this.seen(ps, from, now, s.local);
     this.bootOf(ps, Number(pp[1] ?? 0));
     from.road.send(from.addr, concat(Uint8Array.of(pPair3), be32(s.remote), msg3));
     this.paired(p);
@@ -457,7 +458,7 @@ export class Node {
     this.sessions.set(local, s);
     this.current.set(peer, s);
     const ps = this.peerState(peer)!;
-    this.seen(ps, from, now);
+    this.seen(ps, from, now, s.local);
     this.bootOf(ps, Number(pp[1] ?? 0));
     this.paired(p);
   }
@@ -549,21 +550,30 @@ export class Node {
     return ps;
   }
 
-  private seen(ps: PeerState, from: Endpoint, now: number) {
+  private seen(ps: PeerState, from: Endpoint, now: number, session: number) {
     const k = endpointKey(from);
     let e = ps.eps.get(k);
     if (!e) {
-      e = { ep: from, lastRecv: 0, lastSend: 0 };
+      e = { ep: from, lastRecv: 0, lastSend: 0, session };
       ps.eps.set(k, e);
     }
     e.lastRecv = now;
+    e.session = session;
   }
 
   private candidates(peer: string, ps: PeerState, now: number, all: boolean): EpState[] {
-    const alive = [...ps.eps.values()].filter((e) => now - e.lastRecv <= aliveFor);
+    let alive = [...ps.eps.values()].filter((e) => now - e.lastRecv <= aliveFor);
+    const cur = this.current.get(peer);
+    if (cur && !all) { // roads of the current session: earlier ones may be gone
+      const mine = alive.filter((e) => e.session === cur.local);
+      if (mine.length) alive = mine;
+    }
     if (alive.length > 0 && !all) {
       const rank = (e: EpState) => ({ udp: 0, tcp: 1 } as Record<string, number>)[e.ep.road.name] ?? 2;
-      return [alive.reduce((b, e) => (rank(e) < rank(b) ? e : b))];
+      // the road heard from last; a better kind only if heard within half a second of it
+      let best = alive.reduce((b, e) => (e.lastRecv > b.lastRecv ? e : b));
+      for (const e of alive) if (rank(e) < rank(best) && best.lastRecv - e.lastRecv < 500) best = e;
+      return [best];
     }
     const out = alive;
     const p = this.trust.get(peer);
@@ -573,7 +583,7 @@ export class Node {
       for (const a of addrs ?? []) {
         const ep = { road, addr: a };
         const k = endpointKey(ep);
-        if (!ps.eps.has(k)) ps.eps.set(k, { ep, lastRecv: 0, lastSend: 0 });
+        if (!ps.eps.has(k)) ps.eps.set(k, { ep, lastRecv: 0, lastSend: 0, session: 0 });
         const e = ps.eps.get(k)!;
         if (!out.includes(e)) out.push(e);
       }
@@ -595,9 +605,11 @@ export class Node {
 
   private startInit(now: number, peer: string, ps: PeerState, first: Uint8Array | null) {
     const p = this.trust.get(peer);
-    if (!p || now - ps.lastInit < initEvery) return;
+    if (!p || now - ps.lastInit < initGap(ps)) return;
     ps.lastInit = now;
-    for (const [idx, h] of this.hs) if (!h.pair && h.peer === peer) this.hs.delete(idx);
+    // keep the last few unanswered starts: a reply to any of them opens the session
+    const pending = [...this.hs.entries()].filter(([, h]) => !h.pair && h.peer === peer).sort((a, b) => a[1].at - b[1].at);
+    while (pending.length >= 3) this.hs.delete(pending.shift()![0]);
     const hs = new Handshake({ pattern: "IK", initiator: true, prologue, s: this.id.key, rs: p.key });
     const ts = new Uint8Array(8);
     new DataView(ts.buffer).setBigUint64(0, BigInt(now) * 1_000_000n);
@@ -625,7 +637,7 @@ export class Node {
     for (const [peer, ps] of this.peers) {
       const s = this.current.get(peer);
       if (!s) {
-        if (!ps.st.idle() && now - ps.lastInit >= initEvery && this.trust.get(peer)) {
+        if (!ps.st.idle() && now - ps.lastInit >= initGap(ps) && this.trust.get(peer)) {
           const first = ps.st.nextPacket(now, false);
           this.startInit(now, peer, ps, first?.plain ?? null);
         }
@@ -635,6 +647,8 @@ export class Node {
         this.current.delete(peer);
         continue;
       }
+      const c = this.candidates(peer, ps, now, false);
+      if (c.length === 1) ps.st.reliable = c[0].ep.road.name !== "udp";
       for (let i = 0; ; i++) {
         if (i === 256) {
           this.wake();
@@ -776,6 +790,11 @@ export class Node {
   dictIds(): Uint8Array[] {
     return this.dicts.ids();
   }
+}
+
+/** initGap: retry a handshake after three measured round trips (250 ms – 2 s), else 1 s. */
+function initGap(ps: PeerState): number {
+  return ps.st.srtt === 0 ? initEvery : Math.min(Math.max(3 * ps.st.srtt, 250), 2000);
 }
 
 function idsOf(v: CborValue): Uint8Array[] {

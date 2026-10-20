@@ -160,7 +160,9 @@ export class Trust {
       ...(p.signKey ? { sign_key: b64(p.signKey) } : {}), ...(p.os ? { os: p.os } : {}), ...(p.via ? { via: p.via } : {}),
     }));
     fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
-    fs.writeFileSync(this.file, JSON.stringify(list, null, 2), { mode: 0o600 });
+    // replaced in one step: a node starting meanwhile never reads it half-written
+    fs.writeFileSync(this.file + ".tmp", JSON.stringify(list, null, 2), { mode: 0o600 });
+    fs.renameSync(this.file + ".tmp", this.file);
   }
 }
 

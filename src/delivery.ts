@@ -71,6 +71,8 @@ export class Stream {
   minRTT = 0;
   lastCut = 0;
   delivered = 0;
+  inflightBytes = 0;
+  reliable = false;
   bw = 0; // bytes per ms
   bwAt = 0;
 
@@ -94,15 +96,14 @@ export class Stream {
     }
   }
 
-  /** window: the congestion window, capped by twice the BDP while a queue is building. */
-  window(): number {
-    let w = Math.floor(this.cwnd);
+  /** canSend: the congestion window, capped by twice the BDP (in bytes) while a queue builds;
+   * no window of our own on a reliable road (TCP controls congestion itself). */
+  canSend(): boolean {
+    if (this.reliable) return this.inflight.size < cwndMax;
+    if (this.inflight.size >= Math.floor(this.cwnd)) return false;
     const queue = this.srtt > this.minRTT + Math.max(this.minRTT / 2, 10);
-    if (queue && this.bw > 0 && this.minRTT > 0) {
-      const bdp = Math.floor((2 * this.bw * this.minRTT) / maxPart) + 4;
-      w = Math.min(w, Math.max(bdp, 4));
-    }
-    return w;
+    if (queue && this.bw > 0 && this.minRTT > 0) return this.inflightBytes < 2 * this.bw * this.minRTT + 4 * maxPart;
+    return true;
   }
 
   /** timeout: current estimate plus link time for the parts ahead, doubled per retry. */
@@ -142,6 +143,7 @@ export class Stream {
     const pending = [...this.inflight.values()].sort((a, b) => a.seq - b.seq).concat(this.queue);
     this.next = 1;
     this.inflight = new Map();
+    this.inflightBytes = 0;
     this.queue = [];
     for (const p of pending) {
       Object.assign(p, { seq: this.next++, first: 0, sent: 0, tries: 0, delivered: 0 });
@@ -179,9 +181,10 @@ export class Stream {
     if (p) {
       retry = true;
       this.lost(now);
-    } else if (this.queue.length > 0 && this.inflight.size < this.window()) {
+    } else if (this.queue.length > 0 && this.canSend()) {
       p = this.queue.shift()!;
       this.inflight.set(p.seq, p);
+      this.inflightBytes += p.data.length;
     }
     const ack = this.recvNext > 1 && (p !== undefined || forceAck || (this.ackDue !== 0 && now >= this.ackDue));
     if (!p && !ack) return null;
@@ -237,6 +240,7 @@ export class Stream {
           if (dt > 0) this.rate(now, (this.delivered - p.delivered) / dt);
         }
         this.inflight.delete(seq);
+        this.inflightBytes -= p.data.length;
         done++;
       };
       for (const seq of [...this.inflight.keys()]) if (BigInt(seq) <= upto) ack(seq);
