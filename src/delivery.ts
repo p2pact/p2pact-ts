@@ -10,11 +10,14 @@ export const fMsg = 2; // carries a message part
 export const fMore = 4; // more parts follow
 export const fZip = 8; // compressed; set on every part of a compressed message
 export const fOnce = 16; // do not ack (keepalive)
+export const fFirst = 32; // first part of a message on a stream: stream and number follow
+export const fCont = 64; // a further part of a message on a stream
 
 export const MaxPacket = 1200;
 export const dataHeader = 9;
-// 1200 − 9 (header) − 16 (tag) − 1 (flags) − up to 10 (ack) − up to 5 (number)
-export const maxPart = MaxPacket - dataHeader - 16 - 1 - 10 - 5;
+const ackBudget = 60;
+// 1200 − 9 (header) − 16 (tag) − 1 (flags) − the ack − up to 5 (number) − up to 20 (stream)
+export const maxPart = MaxPacket - dataHeader - 16 - 1 - ackBudget - 5 - 20;
 
 const rtoStart = 500; // ms, before the first round-trip sample
 const rtoMin = 50;
@@ -23,7 +26,7 @@ export const ackDelay = 40;
 const cwndStart = 32;
 const cwndMin = 32;
 const cwndMax = 4096;
-const earlyMax = 512;
+const gotMax = 8192;
 export const msgMax = 16 << 20;
 
 interface Part {
@@ -31,6 +34,9 @@ interface Part {
   data: Uint8Array;
   more: boolean;
   zip: boolean;
+  stream: number;
+  num: number;
+  firstOfStream: boolean;
   first: number; // first sent at, ms (0 — not yet)
   sent: number;
   tries: number;
@@ -76,13 +82,29 @@ export class Stream {
   bw = 0; // bytes per ms
   bwAt = 0;
 
-  recvNext = 1;
-  early = new Map<number, Part>();
-  assembling: Uint8Array[] = [];
-  assembled = 0;
-  zipped = false;
+  snext = new Map<number, number>();
+  recvAck = 1; // first part not received yet
+  got = new Map<number, RPart>();
+  next0 = 1;
+  asm0: Uint8Array[] = [];
+  asm0Len = 0;
+  zip0 = false;
+  streams = new Map<number, { next: number; ready: Map<number, { msg: Uint8Array; zip: boolean }> }>();
   ackDue = 0;
   unacked = 0;
+
+  private resetRecv() {
+    this.snext = new Map();
+    this.recvAck = 1;
+    this.got = new Map();
+    this.next0 = 1;
+    this.asm0 = [];
+    this.asm0Len = 0;
+    this.zip0 = false;
+    this.streams = new Map();
+    this.ackDue = 0;
+    this.unacked = 0;
+  }
 
   rto(): number {
     if (this.srtt === 0) return rtoStart;
@@ -145,26 +167,32 @@ export class Stream {
     this.inflight = new Map();
     this.inflightBytes = 0;
     this.queue = [];
+    this.resetRecv();
     for (const p of pending) {
       Object.assign(p, { seq: this.next++, first: 0, sent: 0, tries: 0, delivered: 0 });
+      if (p.firstOfStream) {
+        const n = (this.snext.get(p.stream) ?? 0) + 1;
+        this.snext.set(p.stream, n);
+        p.num = n;
+      }
       this.queue.push(p);
     }
-    this.recvNext = 1;
-    this.early = new Map();
-    this.assembling = [];
-    this.assembled = 0;
-    this.zipped = false;
-    this.ackDue = 0;
-    this.unacked = 0;
   }
 
-  /** push queues a message in parts; zip marks it compressed. */
-  push(msg: Uint8Array, zip: boolean) {
+  /** push queues a message in parts on a stream (0 — the ordered default); zip — compressed. */
+  push(msg: Uint8Array, zip: boolean, stream = 0) {
+    let num = 0;
+    if (stream !== 0) {
+      num = (this.snext.get(stream) ?? 0) + 1;
+      this.snext.set(stream, num);
+    }
     let off = 0;
+    let first = true;
     do {
       const n = Math.min(msg.length - off, maxPart);
       this.queue.push({ seq: this.next++, data: msg.subarray(off, off + n), more: off + n < msg.length, zip,
-        first: 0, sent: 0, tries: 0, delivered: 0 });
+        stream, num: first ? num : 0, firstOfStream: stream !== 0 && first, first: 0, sent: 0, tries: 0, delivered: 0 });
+      first = false;
       off += n;
     } while (off < msg.length);
   }
@@ -186,16 +214,14 @@ export class Stream {
       this.inflight.set(p.seq, p);
       this.inflightBytes += p.data.length;
     }
-    const ack = this.recvNext > 1 && (p !== undefined || forceAck || (this.ackDue !== 0 && now >= this.ackDue));
+    const received = this.recvAck > 1 || this.got.size > 0;
+    const ack = received && (p !== undefined || forceAck || (this.ackDue !== 0 && now >= this.ackDue));
     if (!p && !ack) return null;
     let flags = 0;
     const b: number[] = [0];
     if (ack) {
       flags |= fAck;
-      putUvarint(b, this.recvNext - 1);
-      let bits = 0n;
-      for (let i = 0; i < 32; i++) if (this.early.has(this.recvNext + 1 + i)) bits |= 1n << BigInt(i);
-      putUvarint(b, bits);
+      this.appendAck(b);
       this.ackDue = 0;
       this.unacked = 0;
     }
@@ -205,6 +231,11 @@ export class Stream {
       if (p.more) flags |= fMore;
       if (p.zip) flags |= fZip;
       putUvarint(b, p.seq);
+      if (p.firstOfStream) {
+        flags |= fFirst;
+        putUvarint(b, p.stream);
+        putUvarint(b, p.num);
+      } else if (p.stream !== 0) flags |= fCont;
       data = p.data;
       if (p.first === 0) p.first = now;
       p.delivered = this.delivered;
@@ -220,15 +251,39 @@ export class Stream {
     return { plain: out, retry };
   }
 
-  /** receive handles packet content; deliver is called for every reassembled message in order. */
-  receive(now: number, b: Uint8Array, deliver: (msg: Uint8Array, zip: boolean) => void) {
+  /** appendAck: all up to recvAck−1, then (missing, received) ranges above the first gap. */
+  private appendAck(b: number[]) {
+    putUvarint(b, this.recvAck - 1);
+    const above = [...this.got.keys()].filter((k) => k > this.recvAck).sort((x, y) => x - y);
+    const ranges: number[] = [];
+    let count = 0;
+    let cursor = this.recvAck;
+    for (let i = 0; i < above.length; ) {
+      let j = i;
+      while (j + 1 < above.length && above[j + 1] === above[j] + 1) j++;
+      const r: number[] = [];
+      putUvarint(r, above[i] - cursor);
+      putUvarint(r, j - i + 1);
+      if (ranges.length + r.length > ackBudget - 12) break;
+      ranges.push(...r);
+      count++;
+      cursor = above[j] + 1;
+      i = j + 1;
+    }
+    putUvarint(b, count);
+    b.push(...ranges);
+  }
+
+  /** receive handles packet content; deliver gets each message as it becomes deliverable. */
+  receive(now: number, b: Uint8Array, deliver: (msg: Uint8Array, zip: boolean, stream: number) => void) {
     if (b.length === 0) throw new Error("empty packet");
     const flags = b[0];
     let pos = 1;
     if (flags & fAck) {
       const [upto, p1] = readUvarint(b, pos);
-      const [bits, p2] = readUvarint(b, p1);
+      const [count, p2] = readUvarint(b, p1);
       pos = p2;
+      if (count > 64n) throw new Error("too many ranges");
       let done = 0;
       const ack = (seq: number) => {
         const p = this.inflight.get(seq);
@@ -244,62 +299,106 @@ export class Stream {
         done++;
       };
       for (const seq of [...this.inflight.keys()]) if (BigInt(seq) <= upto) ack(seq);
-      let ones = 0;
-      for (let i = 0n; i < 32n; i++) {
-        if (bits & (1n << i)) {
-          ones++;
-          ack(Number(upto + 2n + i));
-        }
+      let beyond = 0;
+      let cursor = Number(upto) + 1;
+      for (let i = 0n; i < count; i++) {
+        const [gap, q1] = readUvarint(b, pos);
+        const [run, q2] = readUvarint(b, q1);
+        pos = q2;
+        const start = cursor + Number(gap);
+        for (let seq = start; seq < start + Number(run); seq++) ack(seq);
+        beyond += Number(run);
+        cursor = start + Number(run);
       }
       this.acked(done);
-      if (bits !== 0n) { // fast retransmit: three parts past the gap, or a quarter of a round trip
-        const gap = this.inflight.get(Number(upto + 1n));
-        if (gap && (ones >= 3 || now - gap.sent >= Math.max(this.srtt / 4, ackDelay))) gap.sent = 0;
+      if (beyond > 0) { // fast retransmit: three parts past the gap, or a quarter of a round trip
+        const gap = this.inflight.get(Number(upto) + 1);
+        if (gap && (beyond >= 3 || now - gap.sent >= Math.max(this.srtt / 4, ackDelay))) gap.sent = 0;
       }
     }
     if (!(flags & fMsg)) return;
     const [seq64, p3] = readUvarint(b, pos);
+    pos = p3;
+    const r: RPart = { data: new Uint8Array(0), more: !!(flags & fMore), zip: !!(flags & fZip), first: false, streamed: false,
+      used: false, stream: 0, num: 0 };
+    if (flags & fFirst) {
+      const [st, q1] = readUvarint(b, pos);
+      const [num, q2] = readUvarint(b, q1);
+      pos = q2;
+      Object.assign(r, { first: true, streamed: true, stream: Number(st), num: Number(num) });
+    } else if (flags & fCont) r.streamed = true;
     const seq = Number(seq64);
-    const data = b.subarray(p3);
     if (this.ackDue === 0) this.ackDue = now + ackDelay;
-    // like TCP: ack at once every second part and on anything out of order
-    if (++this.unacked >= 2 || seq !== this.recvNext) this.ackDue = now;
-    if (seq < this.recvNext) return; // duplicate: just ack
-    if (seq > this.recvNext) {
-      if (this.early.size < earlyMax) {
-        this.early.set(seq, { seq, data: data.slice(), more: !!(flags & fMore), zip: !!(flags & fZip), first: 0, sent: 0, tries: 0, delivered: 0 });
-      }
-      return;
-    }
-    this.take(data, !!(flags & fMore), !!(flags & fZip), deliver);
+    if (++this.unacked >= 2 || seq !== this.recvAck) this.ackDue = now;
+    if (seq < this.recvAck || this.got.has(seq) || this.got.size >= gotMax) return;
+    r.data = b.slice(pos);
+    this.got.set(seq, r);
+    while (this.got.has(this.recvAck)) this.recvAck++;
+    if (r.streamed) this.assemble(seq, deliver);
+    this.take0(deliver);
+    for (const [k, x] of this.got) if (x.used && k < this.recvAck && k < this.next0) this.got.delete(k);
+  }
+
+  private assemble(seq: number, deliver: (m: Uint8Array, z: boolean, s: number) => void) {
+    let start = seq;
     for (;;) {
-      const p = this.early.get(this.recvNext);
-      if (!p) return;
-      this.early.delete(this.recvNext);
-      this.take(p.data, p.more, p.zip, deliver);
+      const x = this.got.get(start);
+      if (!x || x.used) return;
+      if (x.first) break;
+      if (!x.streamed || start === 0) return;
+      start--;
+    }
+    const head = this.got.get(start)!;
+    const parts: Uint8Array[] = [];
+    let len = 0;
+    let end = start;
+    for (;;) {
+      const x = this.got.get(end);
+      if (!x || !x.streamed || x.used || (end !== start && x.first)) return;
+      if (len + x.data.length > msgMax) return;
+      parts.push(x.data);
+      len += x.data.length;
+      if (!x.more) break;
+      end++;
+    }
+    for (let k = start; k <= end; k++) this.got.get(k)!.used = true;
+    let st = this.streams.get(head.stream);
+    if (!st) {
+      st = { next: 1, ready: new Map() };
+      this.streams.set(head.stream, st);
+    }
+    if (head.num < st.next) return;
+    st.ready.set(head.num, { msg: joinParts(parts, len), zip: head.zip });
+    for (;;) {
+      const m = st.ready.get(st.next);
+      if (!m) return;
+      st.ready.delete(st.next);
+      st.next++;
+      deliver(m.msg, m.zip, head.stream);
     }
   }
 
-  private take(data: Uint8Array, more: boolean, zip: boolean, deliver: (m: Uint8Array, z: boolean) => void) {
-    this.recvNext++;
-    if (this.assembling.length === 0) this.zipped = zip;
-    if (this.assembled + data.length > msgMax) {
-      this.assembling = [];
-      this.assembled = 0;
-      return;
+  private take0(deliver: (m: Uint8Array, z: boolean, s: number) => void) {
+    for (;;) {
+      const x = this.got.get(this.next0);
+      if (!x) return;
+      this.next0++;
+      if (x.streamed) continue;
+      x.used = true;
+      if (this.asm0.length === 0) this.zip0 = x.zip;
+      if (this.asm0Len + x.data.length > msgMax) {
+        this.asm0 = [];
+        this.asm0Len = 0;
+        continue;
+      }
+      this.asm0.push(x.data);
+      this.asm0Len += x.data.length;
+      if (x.more) continue;
+      const msg = joinParts(this.asm0, this.asm0Len);
+      this.asm0 = [];
+      this.asm0Len = 0;
+      deliver(msg, this.zip0, 0);
     }
-    this.assembling.push(data.slice());
-    this.assembled += data.length;
-    if (more) return;
-    const msg = new Uint8Array(this.assembled);
-    let at = 0;
-    for (const x of this.assembling) {
-      msg.set(x, at);
-      at += x.length;
-    }
-    this.assembling = [];
-    this.assembled = 0;
-    deliver(msg, this.zipped);
   }
 
   idle(): boolean {
@@ -310,6 +409,27 @@ export class Stream {
     for (const p of this.inflight.values()) if (p.tries >= 4) return true;
     return false;
   }
+}
+
+interface RPart {
+  data: Uint8Array;
+  more: boolean;
+  zip: boolean;
+  first: boolean;
+  streamed: boolean;
+  used: boolean;
+  stream: number;
+  num: number;
+}
+
+function joinParts(parts: Uint8Array[], len: number): Uint8Array {
+  const out = new Uint8Array(len);
+  let at = 0;
+  for (const p of parts) {
+    out.set(p, at);
+    at += p.length;
+  }
+  return out;
 }
 
 export const keepalive = () => Uint8Array.of(fOnce);

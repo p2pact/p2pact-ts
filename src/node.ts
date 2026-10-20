@@ -81,7 +81,7 @@ interface PeerState {
   callID: number;
   dicts: Uint8Array[];
   lacks: Uint8Array[];
-  waiting: { msg: Uint8Array; zip: boolean }[];
+  waiting: { msg: Uint8Array; zip: boolean; stream: number }[];
   fetching: boolean;
 }
 
@@ -225,8 +225,13 @@ export class Node {
 
   // --- calls and events ---
 
-  /** call invokes tool.method on a known device; the result elements come as raw CBOR. */
+  /** call invokes tool.method on a known device (stream 0, in order); raw CBOR result elements. */
   call(peer: string, tool: number, method: number, ...args: unknown[]): Promise<Uint8Array[]> {
+    return this.callOn(peer, 0, tool, method, ...args);
+  }
+
+  /** callOn is call on a stream: ordered within it, independent of other streams (one per chat). */
+  callOn(peer: string, stream: number, tool: number, method: number, ...args: unknown[]): Promise<Uint8Array[]> {
     const ps = this.peerState(peer);
     if (!ps) return Promise.reject(new Error("unknown device"));
     const id = ++ps.callID;
@@ -241,14 +246,18 @@ export class Node {
           reject(e);
         },
       });
-      this.push(ps, encode([0, id, tool, method, ...args]));
+      this.push(ps, encode([0, id, tool, method, ...args]), stream);
     });
   }
 
   event(peer: string, tool: number, ev: number, ...args: unknown[]) {
+    this.eventOn(peer, 0, tool, ev, ...args);
+  }
+
+  eventOn(peer: string, stream: number, tool: number, ev: number, ...args: unknown[]) {
     const ps = this.peerState(peer);
     if (!ps) throw new Error("unknown device");
-    this.push(ps, encode([3, tool, ev, ...args]));
+    this.push(ps, encode([3, tool, ev, ...args]), stream);
   }
 
   /** paths lists live roads to a known device. */
@@ -335,7 +344,7 @@ export class Node {
     if (!this.current.has(s.peer)) this.current.set(s.peer, s);
     const ps = this.peerState(s.peer)!;
     this.seen(ps, from, now, s.local);
-    ps.st.receive(now, plain, (m, z) => this.inbound(s.peer, m, z));
+    ps.st.receive(now, plain, (m, z, st) => this.inbound(s.peer, m, z, st));
     if (ps.st.ackDue !== 0 && now >= ps.st.ackDue) this.wake();
   }
 
@@ -360,7 +369,7 @@ export class Node {
     this.seen(ps, from, now, s.local);
     this.bootOf(ps, u32(payload, 8));
     from.road.send(from.addr, concat(Uint8Array.of(pResp), be32(s.remote), be32(local), resp));
-    if (payload.length > 12) ps.st.receive(now, payload.subarray(12), (m, z) => this.inbound(peer, m, z));
+    if (payload.length > 12) ps.st.receive(now, payload.subarray(12), (m, z, st) => this.inbound(peer, m, z, st));
     this.sendInfo(peer);
   }
 
@@ -477,7 +486,7 @@ export class Node {
     this.push(this.peerState(peer)!, encode([3, 0, 2, ...this.info()]));
   }
 
-  private message(peer: string, msg: Uint8Array) {
+  private message(peer: string, msg: Uint8Array, stream = 0) {
     let a: Uint8Array[];
     try {
       a = decodeArrayRaw(msg);
@@ -505,7 +514,7 @@ export class Node {
           }
         }
         const ps2 = this.peerState(peer);
-        if (ps2) this.push(ps2, encode(out));
+        if (ps2) this.push(ps2, encode(out), stream); // the result goes back on the call's stream
       })();
     } else if (kind === 1 || kind === 2) {
       const c = ps.calls.get(decode(a[1]) as number);
@@ -690,26 +699,26 @@ export class Node {
 
   // --- compression (spec §5) ---
 
-  private push(ps: PeerState, msg: Uint8Array) {
+  private push(ps: PeerState, msg: Uint8Array, stream = 0) {
     const [d, slot] = this.dicts.pick(ps.dicts, ps.lacks);
     const z = this.noCompression ? null : compress(msg, d, slot);
-    if (z) ps.st.push(z, true);
-    else ps.st.push(msg, false);
+    if (z) ps.st.push(z, true, stream);
+    else ps.st.push(msg, false, stream);
     this.wake();
   }
 
-  private inbound(peer: string, msg: Uint8Array, zip: boolean) {
+  private inbound(peer: string, msg: Uint8Array, zip: boolean, stream = 0) {
     const ps = this.peerState(peer);
     if (!ps) return;
     if (ps.waiting.length > 0) {
       const r = this.unzip(ps, msg, zip);
       if (r.plain && outOfOrder(r.plain)) {
-        this.message(peer, r.plain);
+        this.message(peer, r.plain, stream);
         this.drain(peer, ps);
         return;
       }
     }
-    ps.waiting.push({ msg, zip });
+    ps.waiting.push({ msg, zip, stream });
     this.drain(peer, ps);
   }
 
@@ -720,7 +729,7 @@ export class Node {
       if (r.missing) return void this.fetchDict(peer, ps, ps.dicts[w.msg[0] - 1]);
       if (r.noList) return;
       ps.waiting.shift();
-      if (r.plain) this.message(peer, r.plain);
+      if (r.plain) this.message(peer, r.plain, w.stream);
     }
   }
 

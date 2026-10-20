@@ -52,7 +52,7 @@ for await (const line of createInterface({ input: process.stdin })) {
         say({ known: !!node.trust.get(req.peer) });
         break;
       case "call": {
-        const res = await node.call(req.peer, 64, 1, new Uint8Array(Buffer.from(req.data, "base64")));
+        const res = await node.callOn(req.peer, Number(req.stream ?? 0), 64, 1, new Uint8Array(Buffer.from(req.data, "base64")));
         say({ data: b64(decode(res[0]) as Uint8Array) });
         break;
       }
