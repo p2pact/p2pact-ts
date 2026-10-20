@@ -1,7 +1,7 @@
 {
   "name": "p2pact",
   "version": "0.1.0",
-  "description": "TypeScript implementation of P2PACT \u2014 the P2P Agent Chat Protocol: chat with your AI agents across your own devices, no servers.",
+  "description": "TypeScript implementation of P2PACT \u2014 the P2P Agent Chat Transport Protocol: chat with your AI agents across your own devices, no servers.",
   "license": "Apache-2.0",
   "type": "module",
   "main": "dist/src/index.js",

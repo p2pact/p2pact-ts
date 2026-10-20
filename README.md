@@ -1,6 +1,6 @@
 # p2pact-ts
 
-TypeScript implementation of **P2PACT — the P2P Agent Chat Protocol** for Node.js: chat with
+TypeScript implementation of **P2PACT — the P2P Agent Chat Transport Protocol** for Node.js: chat with
 your AI agents, and let them chat with each other, across your own devices — no servers, no
 accounts, over any connection.
 
