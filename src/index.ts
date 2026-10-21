@@ -6,3 +6,4 @@ export { Invite, Identity, Trust, Prologue, type Peer, type Hints, type RelayHin
 export { encode, decode, decodeArrayRaw, Raw, type CborValue } from "./cbor.js";
 export { address } from "./crypto.js";
 export { Dict, dictId } from "./compress.js";
+export { commonDict } from "./common.js";

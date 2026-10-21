@@ -7,7 +7,8 @@
   "main": "dist/src/index.js",
   "types": "dist/src/index.d.ts",
   "files": [
-    "dist/src"
+    "dist/src",
+    "dict"
   ],
   "engines": {
     "node": ">=22.15"

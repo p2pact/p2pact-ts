@@ -35,13 +35,16 @@ await phone.call(peer.addr, 1, 2, 1, "run the tests");
 - `call` / `handle` — calls and results; `event` / `onEvent` — events either way.
 - `callOn` / `eventOn` — the same on a stream (one per chat): a loss on one chat does not hold
   up the others.
-- `addDict` — a compression dictionary; a missing one is fetched from the sender.
+- `addDict(commonDict)` — the common compression dictionary (spec §5), shipped in `dict/`.
+  Each device also trains its own dictionary for every device it talks to, off the sending
+  path, and the other side fetches it; `dictState` tells which one compresses now,
+  `noLearning` turns training off.
 - `befriend` — add a device known from the family book without pairing.
 
 ## Status
 
 Pairing, sessions, UDP and TCP roads, delivery with congestion control, messages,
-compression with dictionaries. Not yet: the relay road, the family tool, Bluetooth.
+compression with the common dictionary and per-device own dictionaries. Not yet: the relay road, the family tool, Bluetooth.
 
 ## Develop
 
@@ -51,6 +54,10 @@ npm test
 ```
 
 `dist/src/interop.js` is the interop peer used by p2pact-tests.
+
+Own dictionaries are trained in a worker thread: the content by fastCover (the algorithm of
+`zstd --train`, as p2pact-go), the entropy tables taken from the common dictionary — Node's
+zstd has no trainer, and any valid zstd dictionary works, since only its owner compresses with it.
 
 ## License
 

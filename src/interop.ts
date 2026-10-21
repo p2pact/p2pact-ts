@@ -8,6 +8,7 @@
 //   {"cmd":"known","peer":"…"}                                → {"known":true|false}
 //   {"cmd":"call","peer":"…","data":"<base64>"}               → {"data":"<base64>"}  (echo, tool 64 method 1)
 //   {"cmd":"dict","raw":"<base64>"}                           → {"ok":true}
+//   {"cmd":"dict-state","peer":"…"}                           → {"own":"<base64>"|null,"using":…,"training":bool}
 //   {"cmd":"close"}
 // Errors: {"error":"…"}.
 import * as fs from "node:fs";
@@ -60,6 +61,11 @@ for await (const line of createInterface({ input: process.stdin })) {
         node.addDict(new Uint8Array(Buffer.from(req.raw, "base64")));
         say({ ok: true });
         break;
+      case "dict-state": {
+        const st = node.dictState(req.peer);
+        say({ own: st.own && b64(st.own), using: st.using && b64(st.using), training: st.training });
+        break;
+      }
       case "close":
         node.close();
         process.exit(0);

@@ -7,18 +7,34 @@ import * as zlib from "node:zlib";
 import { blake2s, equal, hex } from "./crypto.js";
 
 export const zipMin = 64;
-const dictKeep = 4;
+// zipFastFrom: from this size on, a faster level — the best one costs more time than the few
+// percent of bytes it saves; zipQuickBelow: shorter messages with a dictionary at the fastest
+// level (most chat messages; loading a 64 KB dictionary for the best one costs milliseconds).
+const zipFastFrom = 32 << 10;
+const zipQuickBelow = 1 << 10;
 const MAGIC = Uint8Array.of(0x28, 0xb5, 0x2f, 0xfd);
 const DICT_MAGIC = 0xec30a437;
 
 export class Dict {
   readonly id: Uint8Array;
   readonly zid: number; // dictionary id inside zstd (0 for a raw-content dictionary)
+  private buf?: Buffer;
 
-  constructor(readonly raw: Uint8Array) {
+  /** peer: "" — a common dictionary, anyone may have it; otherwise it belongs to the pair with
+   * this device and is never shown or given to another. own: we trained it (for peer). */
+  constructor(readonly raw: Uint8Array, readonly peer = "", readonly own = false) {
     this.id = dictId(raw);
     const dv = new DataView(raw.buffer, raw.byteOffset, raw.length);
     this.zid = raw.length >= 8 && dv.getUint32(0, true) === DICT_MAGIC ? dv.getUint32(4, true) : 0;
+  }
+
+  /** visible reports whether the dictionary may be used with, listed to or given to peer. */
+  visible(peer: string): boolean {
+    return this.peer === "" || this.peer === peer;
+  }
+
+  get buffer(): Buffer {
+    return (this.buf ??= Buffer.from(this.raw));
   }
 }
 
@@ -27,10 +43,13 @@ export function dictId(raw: Uint8Array): Uint8Array {
   return blake2s(raw).subarray(0, 16);
 }
 
-function zopts(d: Dict | null): zlib.ZstdOptions {
+function zopts(d: Dict | null, size: number): zlib.ZstdOptions {
   const c = zlib.constants as unknown as Record<string, number>;
-  const o: zlib.ZstdOptions = { params: { [c.ZSTD_c_compressionLevel]: 19, [c.ZSTD_c_checksumFlag]: 0 } };
-  if (d) (o as { dictionary?: Buffer }).dictionary = Buffer.from(d.raw);
+  let level = d ? 7 : 19;
+  if (size >= zipFastFrom) level = 3;
+  else if (d && size < zipQuickBelow) level = 1;
+  const o: zlib.ZstdOptions = { params: { [c.ZSTD_c_compressionLevel]: level, [c.ZSTD_c_checksumFlag]: 0 } };
+  if (d) (o as { dictionary?: Buffer }).dictionary = d.buffer;
   return o;
 }
 
@@ -39,7 +58,7 @@ export function compress(msg: Uint8Array, d: Dict | null, slot: number): Uint8Ar
   if (msg.length < zipMin) return null;
   let frame: Uint8Array | null;
   try {
-    frame = stripFrame(new Uint8Array(zlib.zstdCompressSync(msg, zopts(d))));
+    frame = stripFrame(new Uint8Array(zlib.zstdCompressSync(msg, zopts(d, msg.length))));
   } catch {
     return null;
   }
@@ -56,7 +75,7 @@ export function decompress(b: Uint8Array, d: Dict | null, max: number): Uint8Arr
   const frame = restoreFrame(b.subarray(1), d ? d.zid : 0);
   if (!frame) throw new Error("bad frame");
   const o: zlib.ZstdOptions = { maxOutputLength: max };
-  if (d) (o as { dictionary?: Buffer }).dictionary = Buffer.from(d.raw);
+  if (d) (o as { dictionary?: Buffer }).dictionary = d.buffer;
   const out = zlib.zstdDecompressSync(frame, o);
   return new Uint8Array(out);
 }
@@ -99,10 +118,25 @@ export function restoreFrame(f: Uint8Array, zid: number): Uint8Array | null {
   return out;
 }
 
-/** DictStore keeps dictionaries in dir/net-dicts/<id hex>, newest first in "order". */
+
+// dictKeep is how many dictionaries of one kind to keep (common ones, ours for a device, a
+// device's own): new ones and those still in flight.
+const dictKeep = 4;
+// slotsMax: past this many slots, a new dictionary takes the oldest empty one.
+const slotsMax = 32;
+
+/** DictStore keeps dictionaries in dir/net-dicts/<id hex>; the order (newest first) is in the
+ * file "order", a line per dictionary: "<id hex>" for a common one, "<id hex> <device> own|their"
+ * for a pair's. */
 export class DictStore {
-  dicts: Dict[] = [];
-  private dir: string;
+  dicts: Dict[] = []; // newest first
+  readonly dir: string;
+  // slots: what we list to each device, by slot. A dictionary keeps its slot while listed (a
+  // message compressed with it may still be on its way on another stream, behind the new list);
+  // a dropped one leaves an empty id, and a new one goes to the end.
+  private slots = new Map<string, Uint8Array[]>();
+  private gen = 0; // bumped on every change of the dictionaries
+  private cache = new Map<string, { gen: number; ids: Uint8Array[] }>();
 
   constructor(dir: string) {
     this.dir = path.join(dir, "net-dicts");
@@ -112,40 +146,128 @@ export class DictStore {
     } catch {
       return;
     }
-    for (const h of order.split(/\s+/).filter(Boolean)) {
+    for (const line of order.split("\n")) {
+      const f = line.split(/\s+/).filter(Boolean);
+      if (f.length !== 1 && f.length !== 3) continue; // a damaged line: never take a pair's dictionary for a common one
       try {
-        const d = new Dict(new Uint8Array(fs.readFileSync(path.join(this.dir, h))));
-        if (hex(d.id) === h) this.dicts.push(d);
+        const raw = new Uint8Array(fs.readFileSync(path.join(this.dir, f[0])));
+        const d = f.length === 3 ? new Dict(raw, f[1], f[2] === "own") : new Dict(raw);
+        if (hex(d.id) === f[0]) this.dicts.push(d);
       } catch {
         /* missing file: skip */
       }
     }
   }
 
-  get(id: Uint8Array): Dict | undefined {
-    return this.dicts.find((d) => equal(d.id, id));
+  /** get returns dictionary id if peer may see it. */
+  get(id: Uint8Array, peer: string): Dict | undefined {
+    return this.dicts.find((d) => equal(d.id, id) && d.visible(peer));
   }
 
+  /** add puts a dictionary first (moving it up if known) and deletes the oldest extra ones of its kind. */
   add(d: Dict) {
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(this.dir, hex(d.id)), d.raw, { mode: 0o600 });
-    const out = [d, ...this.dicts.filter((x) => !equal(x.id, d.id))];
-    for (const x of out.slice(dictKeep)) fs.rmSync(path.join(this.dir, hex(x.id)), { force: true });
-    this.dicts = out.slice(0, dictKeep);
-    fs.writeFileSync(path.join(this.dir, "order"), this.dicts.map((x) => hex(x.id)).join("\n") + "\n", { mode: 0o600 });
-  }
-
-  ids(): Uint8Array[] {
-    return this.dicts.map((d) => d.id);
-  }
-
-  /** pick returns our newest dictionary the receiver also has (minus lacks) and its slot. */
-  pick(theirs: Uint8Array[], lacks: Uint8Array[]): [Dict | null, number] {
-    const has = (l: Uint8Array[], id: Uint8Array) => l.some((x) => equal(x, id));
-    for (let i = 0; i < this.dicts.length; i++) {
-      const d = this.dicts[i];
-      if (has(theirs, d.id) && !has(lacks, d.id)) return [d, i + 1];
+    const out = [d], dropped: Dict[] = [];
+    const kinds = new Map<string, number>([[`${d.peer} ${d.own}`, 1]]);
+    for (const x of this.dicts) {
+      if (equal(x.id, d.id) && x.peer === d.peer) continue;
+      const k = `${x.peer} ${x.own}`;
+      const n = (kinds.get(k) ?? 0) + 1;
+      kinds.set(k, n);
+      if (n > dictKeep) dropped.push(x);
+      else out.push(x);
     }
-    return [null, 0];
+    for (const x of dropped) { // one file serves the same bytes kept as another kind
+      if (!listed(out, x.id)) fs.rmSync(path.join(this.dir, hex(x.id)), { force: true });
+    }
+    this.dicts = out;
+    this.gen++;
+    this.saveOrder();
   }
+
+  /** saveOrder writes the file "order" through a temporary file: a torn one could turn a pair's
+   * dictionary into a common one (though loading skips damaged lines too). */
+  private saveOrder() {
+    const lines = this.dicts.map((x) => hex(x.id) + (x.peer ? ` ${x.peer} ${x.own ? "own" : "their"}` : ""));
+    const file = path.join(this.dir, "order");
+    fs.writeFileSync(file + ".tmp", lines.join("\n") + "\n", { mode: 0o600 });
+    fs.renameSync(file + ".tmp", file);
+  }
+
+  /** list is what peer sees of our dictionaries, newest first: the common ones and the pair's. */
+  list(peer: string): Dict[] {
+    const out: Dict[] = [];
+    for (const d of this.dicts) if (d.visible(peer) && !listed(out, d.id)) out.push(d);
+    return out;
+  }
+
+  /** ids is our list for peer, by slot (an empty id — a free slot). */
+  ids(peer: string): Uint8Array[] {
+    return [...this.slotsFor(peer)];
+  }
+
+  /** slotsFor is ids without the copy, rebuilt only when the dictionaries changed. */
+  private slotsFor(peer: string): Uint8Array[] {
+    const c = this.cache.get(peer);
+    if (c && c.gen === this.gen) return c.ids;
+    const list = this.list(peer);
+    const slots = this.slots.get(peer) ?? [];
+    for (let i = 0; i < slots.length; i++) if (slots[i].length > 0 && !listed(list, slots[i])) slots[i] = new Uint8Array(0);
+    for (let j = list.length - 1; j >= 0; j--) { // the oldest first, so the newest gets the last slot
+      const d = list[j];
+      if (has(slots, d.id)) continue;
+      const free = slots.length >= slotsMax ? slots.findIndex((id) => id.length === 0) : -1;
+      if (free < 0) slots.push(d.id);
+      else slots[free] = d.id;
+    }
+    this.slots.set(peer, slots);
+    this.cache.set(peer, { gen: this.gen, ids: slots });
+    return slots;
+  }
+
+  /** slotOf is d's slot in our list for peer (from 1). */
+  slotOf(peer: string, d: Dict): number {
+    return this.slotsFor(peer).findIndex((id) => equal(id, d.id)) + 1;
+  }
+
+  /** own returns our newest dictionary trained for peer. */
+  own(peer: string): Dict | undefined {
+    return this.dicts.find((d) => d.own && d.peer === peer);
+  }
+
+  /** pick returns the dictionary to compress for peer and its slot in our list for peer (from 1):
+   * ours trained for it if it has it, else the newest it also has (its list is theirs, minus
+   * lacks). Nothing in common: no dictionary, slot 0. */
+  pick(peer: string, theirs: Uint8Array[], lacks: Uint8Array[]): [Dict | null, number] {
+    const list = this.list(peer);
+    const ok = (d: Dict) => has(theirs, d.id) && !has(lacks, d.id);
+    const d = list.find((d) => d.own && ok(d)) ?? list.find(ok);
+    return d ? [d, this.slotOf(peer, d)] : [null, 0];
+  }
+
+  /** forget drops what belongs to the pair with peer: our dictionaries for it and its own. */
+  forget(peer: string) {
+    const keep = this.dicts.filter((d) => d.peer !== peer);
+    const drop = this.dicts.filter((d) => d.peer === peer);
+    if (drop.length === 0) return;
+    this.dicts = keep;
+    for (const d of drop) if (!listed(keep, d.id)) fs.rmSync(path.join(this.dir, hex(d.id)), { force: true });
+    this.slots.delete(peer);
+    this.cache.delete(peer);
+    this.gen++;
+    try {
+      this.saveOrder();
+    } catch {
+      /* the next add writes it */
+    }
+  }
+}
+
+function listed(list: Dict[], id: Uint8Array): boolean {
+  return list.some((d) => equal(d.id, id));
+}
+
+export function has(list: Uint8Array[], id: Uint8Array): boolean {
+  return list.some((x) => equal(x, id));
 }

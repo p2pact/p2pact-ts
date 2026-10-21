@@ -1,9 +1,10 @@
 // Node is a device in a P2PACT network (spec §1–§8): pairing, sessions over any road,
 // delivery, messages and compression. Single-threaded: everything runs on the event loop.
 import { decode, decodeArrayRaw, encode, type CborValue } from "./cbor.js";
-import { compress, decompress, Dict, DictStore, dictId } from "./compress.js";
+import { compress, decompress, Dict, DictStore, dictId, has } from "./compress.js";
 import { address, equal, hex, randomBytes } from "./crypto.js";
 import { dataHeader, keepalive, msgMax, Stream } from "./delivery.js";
+import { Learner, learnTiming } from "./learn.js";
 import { CipherState, concat, Handshake } from "./noise.js";
 import { endpointKey, TCPRoad, UDPRoad, type Endpoint, type Road } from "./roads.js";
 import { hintsFromWire, hintsToWire, Identity, Invite, Prologue, Trust, type Hints, type Peer } from "./store.js";
@@ -72,6 +73,7 @@ interface EpState {
 }
 
 interface PeerState {
+  addr: string;
   st: Stream;
   eps: Map<string, EpState>;
   lastTS: bigint;
@@ -79,10 +81,12 @@ interface PeerState {
   lastInit: number;
   calls: Map<number, { resolve: (v: Uint8Array[]) => void; reject: (e: Error) => void }>;
   callID: number;
-  dicts: Uint8Array[];
-  lacks: Uint8Array[];
-  waiting: { msg: Uint8Array; zip: boolean; stream: number }[];
+  dicts: Uint8Array[]; // its dictionaries (ids), by slot — from its hello and 0.5
+  lacks: Uint8Array[]; // it asked us for these, so it lacks them until it announces again
+  waiting: { msg: Uint8Array; zip: boolean; stream: number }[]; // waiting for a dictionary (spec §5)
   fetching: boolean;
+  tried: Uint8Array[]; // dictionaries of its list we asked it for and did not get
+  sysCalls: Set<number>; // our calls of tool 0: their results are not conversation
 }
 
 const u32 = (b: Uint8Array, at: number) => new DataView(b.buffer, b.byteOffset + at, 4).getUint32(0);
@@ -100,8 +104,12 @@ export class Node {
   onEvent?: (peer: string, tool: number, event: number, args: Uint8Array[]) => void;
   onPaired?: (p: Peer) => void;
   onHello?: (peer: string) => void;
+  /** allowDict decides whether a known device may fetch a dictionary (0.5); unset — all may. */
   allowDict?: (peer: string, id: Uint8Array) => boolean;
+  /** noCompression turns compression off for what we send (benchmarks, debugging). */
   noCompression = false;
+  /** noLearning: do not train our own dictionaries on what we send (spec §5). */
+  noLearning = false;
 
   private boot = u32(randomBytes(4), 0) || 1;
   private udp?: UDPRoad;
@@ -114,16 +122,19 @@ export class Node {
   private handlers = new Map<string, Handler>();
   private resetAt = new Map<string, number>();
   private dicts: DictStore;
+  private learner: Learner;
   private timers: NodeJS.Timeout[] = [];
   private woken = false;
+  private closed = false;
   handshakes = 0;
 
   constructor(dir: string, readonly name: string) {
     this.id = Identity.load(dir);
     this.trust = new Trust(dir);
     this.dicts = new DictStore(dir);
+    this.learner = new Learner(dir, this.dicts, (d) => this.addDictLocal(d));
     this.handle(0, 1, () => []);
-    this.handle(0, 2, () => this.info());
+    this.handle(0, 2, (peer) => this.info(peer));
     this.handle(0, 5, (peer, args) => this.dictHandler(peer, args));
   }
 
@@ -145,11 +156,14 @@ export class Node {
   }
 
   start() {
-    this.timers.push(setInterval(() => this.pump(), 20), setInterval(() => this.maintain(), 1000));
+    this.timers.push(setInterval(() => this.pump(), 20), setInterval(() => this.maintain(), 1000),
+      setInterval(() => this.learner.tick(), learnTiming.tick));
   }
 
   close() {
+    this.closed = true;
     for (const t of this.timers) clearInterval(t);
+    this.learner.close();
     this.udp?.close();
     this.tcp?.close();
     for (const ps of this.peers.values()) for (const c of ps.calls.values()) c.reject(new Error("node closed"));
@@ -213,7 +227,11 @@ export class Node {
     this.trust.put({ ...p, pairSecret: this.id.shared(p.key, "family-pair") });
   }
 
+  /** forget drops a known device; our conversation's dictionaries and history go too. */
   forget(addr: string) {
+    this.dicts.forget(addr);
+    this.learner.forget(addr);
+    for (const c of this.peers.get(addr)?.calls.values() ?? []) c.reject(new Error("device forgotten"));
     this.peers.delete(addr);
     const s = this.current.get(addr);
     if (s) {
@@ -232,21 +250,25 @@ export class Node {
 
   /** callOn is call on a stream: ordered within it, independent of other streams (one per chat). */
   callOn(peer: string, stream: number, tool: number, method: number, ...args: unknown[]): Promise<Uint8Array[]> {
+    if (this.closed) return Promise.reject(new Error("node closed"));
     const ps = this.peerState(peer);
     if (!ps) return Promise.reject(new Error("unknown device"));
     const id = ++ps.callID;
+    if (tool === 0) ps.sysCalls.add(id);
     return new Promise((resolve, reject) => {
       ps.calls.set(id, {
         resolve: (v) => {
           ps.calls.delete(id);
+          ps.sysCalls.delete(id);
           resolve(v);
         },
         reject: (e) => {
           ps.calls.delete(id);
+          ps.sysCalls.delete(id);
           reject(e);
         },
       });
-      this.push(ps, encode([0, id, tool, method, ...args]), stream);
+      this.push(ps, encode([0, id, tool, method, ...args]), stream, tool !== 0);
     });
   }
 
@@ -257,7 +279,7 @@ export class Node {
   eventOn(peer: string, stream: number, tool: number, ev: number, ...args: unknown[]) {
     const ps = this.peerState(peer);
     if (!ps) throw new Error("unknown device");
-    this.push(ps, encode([3, tool, ev, ...args]), stream);
+    this.push(ps, encode([3, tool, ev, ...args]), stream, tool !== 0);
   }
 
   /** paths lists live roads to a known device. */
@@ -268,13 +290,14 @@ export class Node {
     return [...new Set([...ps.eps.values()].filter((e) => now - e.lastRecv <= aliveFor).map((e) => e.ep.road.name))];
   }
 
-  private info(): CborValue[] {
+  /** info is the hello (spec §6, 0.2); the dictionaries are those peer may see. */
+  private info(peer: string): CborValue[] {
     const tools = new Map<CborValue, CborValue>();
     for (const k of this.handlers.keys()) {
       const t = Number(k.split(".")[0]);
       if (t !== 0) tools.set(t, 1);
     }
-    return [this.name, goos(), "p2pact-ts", tools, this.dicts.ids(), hintsToWire(this.hints())];
+    return [this.name, goos(), "p2pact-ts", tools, this.dicts.ids(peer), hintsToWire(this.hints())];
   }
 
   private hints(): Hints {
@@ -483,7 +506,7 @@ export class Node {
   }
 
   private sendInfo(peer: string) {
-    this.push(this.peerState(peer)!, encode([3, 0, 2, ...this.info()]));
+    this.push(this.peerState(peer)!, encode([3, 0, 2, ...this.info(peer)]));
   }
 
   private message(peer: string, msg: Uint8Array, stream = 0) {
@@ -500,7 +523,9 @@ export class Node {
     if (kind === 0) {
       if (a.length < 4) return;
       const id = decode(a[1]) as number;
-      const h = this.handlers.get(`${decode(a[2])}.${decode(a[3])}`);
+      const tool = decode(a[2]);
+      if (tool !== 0) this.hear(peer, msg);
+      const h = this.handlers.get(`${tool}.${decode(a[3])}`);
       const args = a.slice(4);
       void (async () => {
         let out: unknown[];
@@ -514,11 +539,13 @@ export class Node {
           }
         }
         const ps2 = this.peerState(peer);
-        if (ps2) this.push(ps2, encode(out), stream); // the result goes back on the call's stream
+        if (ps2) this.push(ps2, encode(out), stream, tool !== 0); // the result goes back on the call's stream
       })();
     } else if (kind === 1 || kind === 2) {
-      const c = ps.calls.get(decode(a[1]) as number);
+      const id = decode(a[1]) as number;
+      const c = ps.calls.get(id);
       if (!c) return;
+      if (!ps.sysCalls.has(id)) this.hear(peer, msg);
       if (kind === 1) c.resolve(a.slice(2));
       else c.reject(new P2PACTError(a.length > 2 ? Number(decode(a[2])) : ErrFailed, a.length > 3 ? String(decode(a[3])) : ""));
     } else if (kind === 3) {
@@ -529,6 +556,8 @@ export class Node {
         this.trust.setHints(peer, String(decode(a[3]) ?? ""), String(decode(a[4]) ?? ""), hintsFromWire(decode(a[8])));
         ps.dicts = idsOf(decode(a[7]));
         ps.lacks = [];
+        ps.tried = [];
+        this.fetchNew(peer, ps);
         this.drain(peer, ps);
         if (this.onHello) queueMicrotask(() => this.onHello!(peer));
         return;
@@ -536,9 +565,12 @@ export class Node {
       if (tool === 0 && ev === 5 && a.length >= 4) {
         ps.dicts = idsOf(decode(a[3]));
         ps.lacks = [];
+        ps.tried = [];
+        this.fetchNew(peer, ps);
         this.drain(peer, ps);
         return;
       }
+      if (tool !== 0) this.hear(peer, msg);
       if (this.onEvent) {
         const args = a.slice(3);
         queueMicrotask(() => this.onEvent!(peer, tool, ev, args));
@@ -552,8 +584,8 @@ export class Node {
     let ps = this.peers.get(peer);
     if (!ps) {
       if (!this.trust.get(peer)) return undefined;
-      ps = { st: new Stream(), eps: new Map(), lastTS: 0n, boot: 0, lastInit: 0, calls: new Map(), callID: 0, dicts: [],
-        lacks: [], waiting: [], fetching: false };
+      ps = { addr: peer, st: new Stream(), eps: new Map(), lastTS: 0n, boot: 0, lastInit: 0, calls: new Map(), callID: 0, dicts: [],
+        lacks: [], waiting: [], fetching: false, tried: [], sysCalls: new Set() };
       this.peers.set(peer, ps);
     }
     return ps;
@@ -633,11 +665,11 @@ export class Node {
   }
 
   private wake() {
-    if (this.woken) return;
+    if (this.woken || this.closed) return;
     this.woken = true;
     setImmediate(() => {
       this.woken = false;
-      this.pump();
+      if (!this.closed) this.pump();
     });
   }
 
@@ -699,14 +731,34 @@ export class Node {
 
   // --- compression (spec §5) ---
 
-  private push(ps: PeerState, msg: Uint8Array, stream = 0) {
-    const [d, slot] = this.dicts.pick(ps.dicts, ps.lacks);
-    const z = this.noCompression ? null : compress(msg, d, slot);
+  /** push queues a message, compressed when worth it: with our dictionary for this device, else
+   * the newest one it also has. The slot refers to our list at send time: the list changes only
+   * through event 0.5, which travels in the same order as messages. talk: the message is
+   * conversation (not tool 0), so it goes to the history (learn.ts). */
+  private push(ps: PeerState, msg: Uint8Array, stream = 0, talk = false) {
+    if (this.noCompression) {
+      ps.st.push(msg, false, stream);
+      this.wake();
+      return;
+    }
+    const [d, slot] = this.dicts.pick(ps.addr, ps.dicts, ps.lacks);
+    const z = compress(msg, d, slot);
+    if (talk && !this.noLearning) this.learner.talk(ps.addr, msg, d, z);
     if (z) ps.st.push(z, true, stream);
     else ps.st.push(msg, false, stream);
     this.wake();
   }
 
+  /** hear queues a conversation message we got from the device for the history. */
+  private hear(peer: string, msg: Uint8Array) {
+    if (!this.noCompression && !this.noLearning) this.learner.hear(peer, msg);
+  }
+
+  /** inbound decompresses a reassembled message and runs it in order. A missing dictionary is
+   * not an error: we hold the message and everything after it and ask the sender for the
+   * dictionary; if we do not know the sender's list yet (it restarted), we wait for its hello.
+   * While waiting, only replies to our calls (the dictionary among them), hellos and dictionary
+   * lists run out of order: nothing depends on their order. */
   private inbound(peer: string, msg: Uint8Array, zip: boolean, stream = 0) {
     const ps = this.peerState(peer);
     if (!ps) return;
@@ -722,17 +774,25 @@ export class Node {
     this.drain(peer, ps);
   }
 
+  /** drain runs waiting messages in order until one cannot be decoded yet. */
   private drain(peer: string, ps: PeerState) {
     while (ps.waiting.length > 0) {
       const w = ps.waiting[0];
       const r = this.unzip(ps, w.msg, w.zip);
-      if (r.missing) return void this.fetchDict(peer, ps, ps.dicts[w.msg[0] - 1]);
-      if (r.noList) return;
+      if (r.missing) {
+        const id = ps.dicts[w.msg[0] - 1];
+        if (id.length > 0) return void this.fetchDict(peer, ps, id, true);
+        ps.waiting.shift(); // a free slot: the message is damaged
+        continue;
+      }
+      if (r.noList) return; // wait for a hello or 0.5
       ps.waiting.shift();
       if (r.plain) this.message(peer, r.plain, w.stream);
     }
   }
 
+  /** unzip decompresses a message; missing — we lack the dictionary in that slot, noList — the
+   * slot is beyond the list we know. */
   private unzip(ps: PeerState, msg: Uint8Array, zip: boolean): { plain?: Uint8Array; missing?: boolean; noList?: boolean } {
     if (!zip) return { plain: msg };
     if (msg.length < 1) return {};
@@ -740,7 +800,7 @@ export class Node {
     const slot = msg[0];
     if (slot > 0) {
       if (slot > ps.dicts.length) return { noList: true };
-      d = this.dicts.get(ps.dicts[slot - 1]) ?? null;
+      d = this.dicts.get(ps.dicts[slot - 1], ps.addr) ?? null;
       if (!d) return { missing: true };
     }
     try {
@@ -750,54 +810,99 @@ export class Node {
     }
   }
 
-  private fetchDict(peer: string, ps: PeerState, id: Uint8Array) {
+  /** fetchNew asks the device for the newest dictionary in its list that we lack: so it can
+   * compress with it (only a dictionary both have is used). One at a time; one we could not get
+   * (the family's, say) is not asked for again until its list changes. */
+  private fetchNew(peer: string, ps: PeerState) {
+    const id = ps.dicts.find((id) => id.length > 0 && !this.dicts.get(id, peer) && !has(ps.tried, id));
+    if (id) this.fetchDict(peer, ps, id, false);
+  }
+
+  /** fetchDict asks the device for dictionary id: one it compressed a waiting message with (it
+   * has it), or a new one in its list. What we get belongs to the pair with it. */
+  private fetchDict(peer: string, ps: PeerState, id: Uint8Array, waiting: boolean) {
     if (ps.fetching) return;
     ps.fetching = true;
     void (async () => {
       let d: Dict | null = null;
-      for (let i = 0; i < 3 && !d; i++) {
+      for (let i = 0; i < 3 && !d && !this.closed; i++) {
         try {
           const res = await withTimeout(this.call(peer, 0, 5, id), 30_000);
           const raw = decode(res[0]);
-          if (raw instanceof Uint8Array && equal(dictId(raw), id)) d = new Dict(raw);
+          if (raw instanceof Uint8Array && equal(dictId(raw), id)) d = new Dict(raw.slice(), peer);
         } catch {
           /* retry */
         }
       }
       ps.fetching = false;
-      if (d) this.addDictLocal(d);
-      else ps.waiting.shift(); // unreachable dictionary: this message is lost
+      if (this.closed || this.peers.get(peer) !== ps) return; // forgotten meanwhile
+      if (d) {
+        try {
+          this.addDictLocal(d); // announces our list again: now with it
+        } catch {
+          d = null; // could not store it: do not ask again and again
+        }
+      }
+      if (!d) {
+        if (waiting && ps.waiting.length > 0) ps.waiting.shift(); // the dictionary is unreachable: this message is lost
+        else ps.tried.push(id);
+      }
       this.drain(peer, ps);
+      this.fetchNew(peer, ps);
     })();
   }
 
+  /** dictHandler serves 0.5 dict [id] → dictionary bytes, only one the asker may see. A device
+   * that asks lacks it, so we stop compressing with it for that device (this reply included)
+   * until it announces again. */
   private dictHandler(peer: string, args: Uint8Array[]): CborValue[] {
     const id = args.length ? decode(args[0]) : null;
     if (!(id instanceof Uint8Array)) throw new P2PACTError(ErrBadArgs, "dictionary id required");
     if (this.allowDict && !this.allowDict(peer, id)) throw new P2PACTError(ErrForbidden, "dictionary is for the family only");
     this.peers.get(peer)?.lacks.push(id);
-    const d = this.dicts.get(id);
+    const d = this.dicts.get(id, peer);
     if (!d) throw new P2PACTError(ErrNotFound, "no such dictionary");
     return [d.raw];
   }
 
-  /** addDict stores a new (newest) dictionary and announces it (event 0.5). */
+  /** addDict stores a new (newest) common dictionary — commonDict, say — and announces it to all
+   * known devices (event 0.5). */
   addDict(raw: Uint8Array) {
     this.addDictLocal(new Dict(raw));
   }
 
+  /** addDictLocal stores a dictionary and announces the new list to the devices that see it: all
+   * for a common one, the pair's device for its own. Only over a live session: a new one starts
+   * with our hello, which carries the list, and a queued announcement would open it early,
+   * without the message the session is for. */
   private addDictLocal(d: Dict) {
     this.dicts.add(d);
-    const msg = encode([3, 0, 5, this.dicts.ids()]);
     for (const p of this.trust.list()) {
+      if (!d.visible(p.addr) || !this.current.has(p.addr)) continue;
       const ps = this.peerState(p.addr);
-      if (ps) ps.st.push(msg, false);
+      if (ps) ps.st.push(encode([3, 0, 5, this.dicts.ids(p.addr)]), false);
     }
     this.wake();
   }
 
-  dictIds(): Uint8Array[] {
-    return this.dicts.ids();
+  /** dictIds lists the dictionary ids peer sees, by slot (an empty id — a free slot). */
+  dictIds(peer: string): Uint8Array[] {
+    return this.dicts.ids(peer);
+  }
+
+  /** dictState tells what compresses messages to peer: own — our newest dictionary trained for it
+   * (null — none yet), using — the one used now (null — none, plain zstd), training — a new one is
+   * due or being trained, or messages wait to be learnt. */
+  dictState(peer: string): { own: Uint8Array | null; using: Uint8Array | null; training: boolean } {
+    const own = this.dicts.own(peer)?.id ?? null;
+    const ps = this.peers.get(peer);
+    const using = ps ? this.dicts.pick(peer, ps.dicts, ps.lacks)[0]?.id ?? null : null;
+    return { own, using, training: this.learner.training(peer) };
+  }
+
+  /** learning exposes the learner to tests. */
+  get learning(): Learner {
+    return this.learner;
   }
 }
 
@@ -818,7 +923,7 @@ function outOfOrder(m: Uint8Array): boolean {
 
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error("timeout")), ms);
+    const t = setTimeout(() => reject(new Error("timeout")), ms).unref();
     p.then((v) => {
       clearTimeout(t);
       resolve(v);
