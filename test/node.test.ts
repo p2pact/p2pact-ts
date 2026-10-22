@@ -240,3 +240,23 @@ test("a restart with parts in flight", async () => {
 function text(s: string) {
   return new TextEncoder().encode(s);
 }
+
+// Our addresses changed (another network): the device in session learns them from our hello at
+// once, without a new handshake.
+test("a new address is told at once", async () => {
+  const a = await node("Mac", { udp: true }), b = await node("Phone", { udp: true });
+  try {
+    await pair(a, b);
+    await echo(a, b, new Uint8Array([1, 2]));
+    a.udpRoad!.localAddrs = () => ["10.238.250.33:48740"]; // another network
+    for (let i = 0; i < 100; i++) {
+      const h = b.trust.get(a.id.addr)?.hints.udp;
+      if (h?.length === 1 && h[0] === "10.238.250.33:48740") return;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.fail("b did not learn a's new address");
+  } finally {
+    a.close();
+    b.close();
+  }
+});

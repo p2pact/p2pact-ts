@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { commonDict, decode, Invite, Node, P2PACTError } from "../src/index.js";
+import { commonDict, decode, encode, ErrFailed, Invite, Node, P2PACTError } from "../src/index.js";
+import { bootstrap, holdTiming } from "../src/node.js";
 import { compress, decompress, Dict, DictStore } from "../src/compress.js";
 import { buildDict, entropyEnd, trainDict } from "../src/cover.js";
 import { historyPath, learnTiming } from "../src/learn.js";
@@ -232,6 +233,83 @@ test("training waits for a lull", async () => {
     await waitFor("a did not train in the lull", () => a.dictState(b.id.addr).own !== null);
   } finally {
     learnTiming.lull = lull;
+    a.close();
+    b.close();
+  }
+});
+
+const longText = Array.from({ length: 8 }, (_, i) => new TextDecoder().decode(chatLine(i))).join(" ");
+
+// inside: the node's private state, for tests that break it on purpose
+const inside = (n: Node) => n as unknown as {
+  peers: Map<string, { dicts: Uint8Array[] }>;
+  guessBootstrap(ps: { addr: string }, msg: Uint8Array): Uint8Array | null;
+};
+
+async function pairWithDict(a: Node, b: Node) {
+  a.noLearning = b.noLearning = true;
+  await pair(a, b);
+  a.addDict(testDict(0));
+  b.addDict(testDict(0));
+  await waitFor("a did not see b's list", () => a.dictState(b.id.addr).using !== null);
+  await waitFor("b did not see a's list", () => b.dictState(a.id.addr).using !== null);
+}
+
+// The receiver lost the sender's list (it restarted, the hello did not come again) while the
+// sender keeps compressing: the receiver asks for the hello (0.2 info) and runs the messages.
+test("a lost list is asked for with 0.2 info", async () => {
+  const a = await node("Phone"), b = await node("Mac");
+  try {
+    await pairWithDict(a, b);
+    inside(b).peers.get(a.id.addr)!.dicts = []; // b no longer knows a's list
+    const late = (ms: number) => new Promise<never>((_, reject) => setTimeout(() => reject(new Error("b held the call")), ms).unref());
+    for (let i = 0; i < 3; i++) await Promise.race([echo(a, b, new TextEncoder().encode(longText)), late(10_000)]);
+  } finally {
+    a.close();
+    b.close();
+  }
+});
+
+// A sender of an older version compressed its hello: the receiver without its list reads it
+// with a dictionary it has for that sender. Only a hello or a list is taken this way.
+test("an older sender's compressed hello is read with the pair's dictionaries", async () => {
+  const b = await node("Mac");
+  try {
+    const d = new Dict(testDict(0));
+    b.addDict(d.raw);
+    const hello = encode([3, 0, 2, "Phone", "android", "p2pact-kotlin", new Map(), [d.id], new Map(), longText]);
+    const z = compress(hello, d, 7);
+    const other = encode([3, 64, 1, longText]);
+    const zo = compress(other, d, 7);
+    assert.ok(z && zo);
+    const ps = { addr: "phone" };
+    assert.deepEqual(inside(b).guessBootstrap(ps, z), hello);
+    assert.equal(inside(b).guessBootstrap(ps, zo), null, "a message other than a hello or a list was taken");
+    assert.ok(bootstrap(hello) && !bootstrap(other));
+  } finally {
+    b.close();
+  }
+});
+
+// Messages held for a list that never comes are not held forever: they are dropped (the sender
+// resends what matters), the application is told, and the lists are learnt anew.
+test("held messages are dropped", async () => {
+  const old = { ...holdTiming };
+  holdTiming.ask = 200;
+  holdTiming.drop = 1000;
+  const a = await node("Phone"), b = await node("Mac");
+  try {
+    await pairWithDict(a, b);
+    a.handle(0, 2, () => {
+      throw new P2PACTError(ErrFailed, "no");
+    });
+    let held = 0;
+    b.onHeld = (_peer, k) => (held = k);
+    inside(b).peers.get(a.id.addr)!.dicts = []; // b lost a's list, and a will not tell it
+    a.event(b.id.addr, 9, 1, longText);
+    await waitFor("held messages were never dropped", () => held > 0, 10_000);
+  } finally {
+    Object.assign(holdTiming, old);
     a.close();
     b.close();
   }

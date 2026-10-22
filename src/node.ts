@@ -18,6 +18,11 @@ const keepaliveGap = 25_000;
 const sessionIdle = 180_000;
 const prologue = new TextEncoder().encode(Prologue);
 
+/** holdTiming: held messages (spec §5) wait for the sender's dictionary or its list. That must not
+ * last: after ask we ask again (its hello, the dictionary); after drop the held messages are
+ * dropped — the sender resends what matters — and the lists are learnt anew. Tests shorten them. */
+export const holdTiming = { ask: 15_000, drop: 120_000 };
+
 /** Error codes (spec §6). */
 export const ErrNoMethod = 1, ErrBadArgs = 2, ErrNotFound = 3, ErrForbidden = 4, ErrFailed = 5, ErrNotDelivered = 6;
 
@@ -103,7 +108,10 @@ interface PeerState {
   dicts: Uint8Array[]; // its dictionaries (ids), by slot — from its hello and 0.5
   lacks: Uint8Array[]; // it asked us for these, so it lacks them until it announces again
   waiting: { msg: Uint8Array; zip: boolean; stream: number }[]; // waiting for a dictionary (spec §5)
+  waitSince: number; // when the head of waiting started to wait (unhold unblocks it)
   fetching: boolean;
+  askingInfo: boolean; // our 0.2 info call is on its way (askInfo)
+  askedInfo: number; // when we asked
   tried: Uint8Array[]; // dictionaries of its list we asked it for and did not get
   sysCalls: Set<number>; // our calls of tool 0: their results are not conversation
   inbox: Map<number, (() => Promise<void> | void)[]>; // calls and events waiting for their turn, per stream
@@ -126,6 +134,9 @@ export class Node {
   onEvent?: (peer: string, tool: number, event: number, args: Uint8Array[]) => void | Promise<void>;
   onPaired?: (p: Peer) => void;
   onHello?: (peer: string) => void;
+  /** onHeld is called when messages from a device waited too long for a dictionary or its list
+   * and were dropped (held — how many): the application can tell the user or resend. */
+  onHeld?: (peer: string, held: number) => void;
   /** allowDict decides whether a known device may fetch a dictionary (0.5); unset — all may. */
   allowDict?: (peer: string, id: Uint8Array) => boolean;
   /** noCompression turns compression off for what we send (benchmarks, debugging). */
@@ -148,6 +159,8 @@ export class Node {
   private timers: NodeJS.Timeout[] = [];
   private woken = false;
   private closed = false;
+  private hintsSent: Uint8Array | null = null; // our addresses as last announced (reannounce)
+  private hintsAt = 0; // when last checked
   handshakes = 0;
 
   constructor(dir: string, readonly name: string) {
@@ -536,6 +549,7 @@ export class Node {
   }
 
   private sendInfo(peer: string) {
+    this.hintsSent = encode(hintsToWire(this.hints())); // what the devices know of us (reannounce)
     this.push(this.peerState(peer)!, encode([3, 0, 2, ...this.info(peer)]));
   }
 
@@ -555,7 +569,8 @@ export class Node {
       const id = decode(a[1]) as number;
       const tool = decode(a[2]);
       if (tool !== 0) this.hear(peer, msg);
-      const h = this.handlers.get(`${tool}.${decode(a[3])}`);
+      const method = decode(a[3]);
+      const h = this.handlers.get(`${tool}.${method}`);
       const args = a.slice(4);
       const boot = ps.boot;
       const reply = async (res: CborValue[] | PromiseLike<CborValue[]>) => {
@@ -568,7 +583,11 @@ export class Node {
         }
         // the result goes back on the call's stream, unless the caller restarted meanwhile
         const ps2 = this.peerState(peer);
-        if (ps2 && (boot === 0 || ps2.boot === boot)) this.push(ps2, encode(out), stream, tool !== 0, true);
+        if (!ps2 || (boot !== 0 && ps2.boot !== boot)) return;
+        if (tool === 0 && method === 2) { // a hello, like the event: never compressed
+          ps2.st.push(encode(out), false, stream, true);
+          this.wake();
+        } else this.push(ps2, encode(out), stream, tool !== 0, true);
       };
       const run = async () => {
         if (!h) return reply(Promise.reject(new P2PACTError(ErrNoMethod, "no such method")));
@@ -651,7 +670,7 @@ export class Node {
     if (!ps) {
       if (!this.trust.get(peer)) return undefined;
       ps = { addr: peer, st: new Stream(), eps: new Map(), lastTS: 0n, boot: 0, heard: false, lastInit: 0, calls: new Map(), callID: 0, dicts: [],
-        lacks: [], waiting: [], fetching: false, tried: [], sysCalls: new Set(), inbox: new Map() };
+        lacks: [], waiting: [], waitSince: 0, fetching: false, askingInfo: false, askedInfo: 0, tried: [], sysCalls: new Set(), inbox: new Map() };
       this.peers.set(peer, ps);
     }
     return ps;
@@ -786,6 +805,43 @@ export class Node {
     for (const [idx, s] of this.sessions) if (this.current.get(s.peer) !== s && now - s.lastRecv > sessionIdle) this.sessions.delete(idx);
     for (const [idx, h] of this.hs) if (now - h.at > 60_000) this.hs.delete(idx);
     for (const [id, inv] of this.invites) if (now > inv.exp.getTime()) this.invites.delete(id);
+    this.unhold(now);
+    this.reannounce(now);
+  }
+
+  /** unhold: held messages do not wait forever (holdTiming). */
+  private unhold(now: number) {
+    for (const [peer, ps] of this.peers) {
+      if (ps.waiting.length === 0) continue;
+      const held = now - ps.waitSince;
+      if (held >= holdTiming.drop) {
+        const k = ps.waiting.length;
+        ps.waiting = [];
+        ps.fetching = ps.askingInfo = false;
+        ps.dicts = [];
+        ps.lacks = [];
+        ps.tried = [];
+        this.sendInfo(peer); // ours again: the other side re-learns what we have
+        if (this.onHeld) queueMicrotask(() => this.onHeld!(peer, k));
+      } else if (held >= holdTiming.ask) {
+        if (ps.dicts.length === 0) this.askInfo(peer, ps);
+        else {
+          ps.tried = [];
+          this.drain(peer, ps);
+        }
+      }
+    }
+  }
+
+  /** reannounce: our addresses changed (another network) — tell the devices in session at once
+   * with our hello, not at the next handshake: after a network switch they would keep trying the
+   * old address until a relay or a restart brought them together. */
+  private reannounce(now: number) {
+    if (now - this.hintsAt < 5000) return;
+    this.hintsAt = now;
+    const cur = encode(hintsToWire(this.hints()));
+    if (!this.hintsSent || equal(cur, this.hintsSent)) return; // nothing announced yet, or the same
+    for (const peer of this.current.keys()) this.sendInfo(peer);
   }
 
   private newIndex(): number {
@@ -803,7 +859,7 @@ export class Node {
    * conversation (not tool 0), so it goes to the history (learn.ts); reply: a result or error,
    * dropped if the other device restarts (spec §4.2). */
   private push(ps: PeerState, msg: Uint8Array, stream = 0, talk = false, reply = false) {
-    if (this.noCompression) {
+    if (this.noCompression || bootstrap(msg)) {
       ps.st.push(msg, false, stream, reply);
       this.wake();
       return;
@@ -837,6 +893,7 @@ export class Node {
         return;
       }
     }
+    if (ps.waiting.length === 0) ps.waitSince = Date.now();
     ps.waiting.push({ msg, zip, stream });
     this.drain(peer, ps);
   }
@@ -852,10 +909,62 @@ export class Node {
         ps.waiting.shift(); // a free slot: the message is damaged
         continue;
       }
-      if (r.noList) return; // wait for a hello or 0.5
+      if (r.noList) {
+        // a sender of an older version compresses its hello too: then we would wait for it
+        // forever. Try the dictionaries we have for it — only a hello or a list is taken
+        const plain = this.guessBootstrap(ps, w.msg);
+        if (plain) {
+          ps.waiting.shift();
+          this.message(peer, plain, w.stream);
+          continue;
+        }
+        this.askInfo(peer, ps);
+        return; // wait for a hello or 0.5
+      }
       ps.waiting.shift();
       if (r.plain) this.message(peer, r.plain, w.stream);
     }
+  }
+
+  /** guessBootstrap decompresses a message whose slot is beyond the sender's list we know with
+   * each dictionary the sender may have used for us (the pair's and the common ones); only a
+   * hello or a dictionary list is accepted, null — none fits. */
+  private guessBootstrap(ps: PeerState, msg: Uint8Array): Uint8Array | null {
+    if (msg.length < 2 || msg[0] === 0) return null;
+    for (const d of this.dicts.list(ps.addr)) {
+      try {
+        const plain = decompress(msg, d, msgMax);
+        if (!bootstrap(plain)) continue;
+        decodeArrayRaw(plain);
+        return plain;
+      } catch {
+        /* not this one */
+      }
+    }
+    return null;
+  }
+
+  /** askInfo asks the device for its hello (0.2 info) when we hold its messages without its
+   * list: it may never send the event again on its own. One at a time; a newer device answers
+   * uncompressed, an older one — with a slot we may guess (guessBootstrap). */
+  private askInfo(peer: string, ps: PeerState) {
+    if (ps.askingInfo || Date.now() - ps.askedInfo < 10_000 || this.closed) return;
+    ps.askingInfo = true;
+    ps.askedInfo = Date.now();
+    void (async () => {
+      let res: Uint8Array[] | null = null;
+      try {
+        res = await withTimeout(this.call(peer, 0, 2), 30_000);
+      } catch {
+        /* asked again later (unhold) */
+      }
+      ps.askingInfo = false;
+      if (this.closed || this.peers.get(peer) !== ps) return; // forgotten meanwhile
+      if (!res || res.length < 5 || ps.dicts.length > 0) return;
+      ps.dicts = idsOf(decode(res[4]));
+      this.fetchNew(peer, ps);
+      this.drain(peer, ps);
+    })();
   }
 
   /** unzip decompresses a message; missing — we lack the dictionary in that slot, noList — the
@@ -985,7 +1094,14 @@ function idsOf(v: CborValue): Uint8Array[] {
 /** outOfOrder: results/errors of our calls, hellos and dictionary lists may skip the queue. */
 function outOfOrder(m: Uint8Array): boolean {
   if (m.length < 2) return false;
-  return m[1] === 1 || m[1] === 2 || (m.length > 3 && m[1] === 3 && m[2] === 0 && (m[3] === 2 || m[3] === 5));
+  return m[1] === 1 || m[1] === 2 || bootstrap(m);
+}
+
+/** bootstrap reports a hello or a dictionary list ([3, 0, 2|5, …]): they carry what the receiver
+ * needs to decompress, so they always go uncompressed — a device that restarted (and lost our
+ * list) must be able to read them. */
+export function bootstrap(m: Uint8Array): boolean {
+  return m.length > 3 && m[1] === 3 && m[2] === 0 && (m[3] === 2 || m[3] === 5);
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
