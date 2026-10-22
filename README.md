@@ -32,7 +32,7 @@ const peer = await phone.join(Invite.parse(invite));     // pair once
 await phone.call(peer.addr, 1, 2, 1, "run the tests");
 ```
 
-- `call` / `handle` — calls and results; `event` / `onEvent` — events either way.
+- `call` / `handle` — calls and results; `event` / `onEvent` — events either way. Calls and events of one device on one stream run in the order sent, one at a time; other streams do not wait.
 - `callOn` / `eventOn` — the same on a stream (one per chat): a loss on one chat does not hold
   up the others.
 - `addDict(commonDict)` — the common compression dictionary (spec §5), shipped in `dict/`.

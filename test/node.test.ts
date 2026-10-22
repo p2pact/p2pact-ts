@@ -104,3 +104,103 @@ test("a restarted device resumes by itself", async () => {
     b.close();
   }
 });
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const within = <T>(p: Promise<T>, ms: number): Promise<T> =>
+  Promise.race([p, sleep(ms).then(() => Promise.reject(new Error(`no answer in ${ms} ms`)))]);
+
+// Events and calls of one stream run in the order sent, one at a time; a slow handler holds
+// up its own stream only (spec §6).
+test("a stream's calls and events run in order", async () => {
+  const a = await node("Laptop", { udp: true }), b = await node("Phone", { udp: true });
+  try {
+    await pair(a, b);
+    let release!: () => void;
+    const released = new Promise<void>((r) => (release = r));
+    b.handle(64, 2, async () => { // slow, on stream 2
+      await released;
+      return [];
+    });
+    const total = 300;
+    const got: number[] = [];
+    let done!: () => void;
+    const all = new Promise<void>((r) => (done = r));
+    b.onEvent = async (_p, _t, ev) => {
+      await sleep(Math.random() < 0.3 ? 1 : 0); // run all at once, they would reorder
+      got.push(ev);
+      if (got.length === total) done();
+    };
+    const slow = a.callOn(b.id.addr, 2, 64, 2);
+    await sleep(50);
+    a.eventOn(b.id.addr, 2, 64, 0); // behind the slow call
+    for (let i = 1; i < total; i++) a.eventOn(b.id.addr, 1, 64, i);
+    for (let i = 0; i < 300 && got.length < total - 1; i++) await sleep(10);
+    await sleep(100);
+    assert.equal(got.length, total - 1, "the slow call held up another stream, or an event overtook it");
+    assert.ok(!got.includes(0), "an event overtook the slow call on its stream");
+    release();
+    await within(slow, 10_000);
+    await within(all, 10_000);
+    assert.equal(got[total - 1], 0);
+    for (let i = 1; i < total; i++) assert.equal(got[i - 1], i, `out of order at ${i}`);
+  } finally {
+    a.close();
+    b.close();
+  }
+});
+
+// The other device restarts silently while our calls are in flight: we handshake again with
+// a part in the first packet, numbered for its old boot; its reply renumbers everything
+// (spec §4.2). Every call must still run exactly once, and later calls must not be lost.
+test("a restart with parts in flight", async () => {
+  const dir = tmp();
+  const a = await node("Laptop", { udp: true });
+  let b = await (async () => {
+    const n = new Node(dir, "Phone");
+    await n.listenUDP("127.0.0.1:0");
+    n.handle(64, 1, (_p, args) => [decode(args[0])]);
+    n.start();
+    return n;
+  })();
+  const runs = new Map<string, number>();
+  const count = (n: Node) =>
+    n.handle(64, 3, (_p, args) => {
+      const s = String(decode(args[0]));
+      runs.set(s, (runs.get(s) ?? 0) + 1);
+      return [s];
+    });
+  const call = async (s: string) => {
+    const res = await within(a.call(b.id.addr, 64, 3, s), 10_000);
+    assert.equal(decode(res[0]), s, `${s} answered ${String(decode(res[0]))}`);
+  };
+  try {
+    await pair(a, b);
+    for (let i = 0; i < 10; i++) await echo(a, b, text("before")); // the numbering moves on
+    const addr = b.udpRoad!.localAddr();
+    b.udpRoad!.drop = () => true; // the calls below never reach the old boot
+    const lost = ["lost 1", "lost 2", "lost 3"].map(call);
+    await sleep(300);
+    b.close();
+    b = new Node(dir, "Phone");
+    count(b);
+    await b.listenUDP(addr);
+    // we notice first (the new boot only answers handshakes before start): the session is gone
+    // and the lost calls are due, so the first one rides in the handshake's first packet
+    const ai = a as unknown as { current: Map<string, unknown>; peers: Map<string, { st: { inflight: Map<number, { sent: number }> } }>; wake(): void };
+    ai.current.delete(b.id.addr);
+    for (const p of ai.peers.get(b.id.addr)!.st.inflight.values()) p.sent = 0;
+    ai.wake();
+    await sleep(300);
+    b.start();
+    await Promise.all(lost);
+    for (let i = 0; i < 20; i++) await call(`after ${i}`);
+    for (const [s, n] of runs) assert.equal(n, 1, `${s} ran ${n} times`);
+  } finally {
+    a.close();
+    b.close();
+  }
+});
+
+function text(s: string) {
+  return new TextEncoder().encode(s);
+}

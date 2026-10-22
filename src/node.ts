@@ -78,6 +78,7 @@ interface PeerState {
   eps: Map<string, EpState>;
   lastTS: bigint;
   boot: number;
+  heard: boolean; // it knows our boot id: sent us session data or answered our handshake
   lastInit: number;
   calls: Map<number, { resolve: (v: Uint8Array[]) => void; reject: (e: Error) => void }>;
   callID: number;
@@ -87,6 +88,7 @@ interface PeerState {
   fetching: boolean;
   tried: Uint8Array[]; // dictionaries of its list we asked it for and did not get
   sysCalls: Set<number>; // our calls of tool 0: their results are not conversation
+  inbox: Map<number, (() => Promise<void> | void)[]>; // calls and events waiting for their turn, per stream
 }
 
 const u32 = (b: Uint8Array, at: number) => new DataView(b.buffer, b.byteOffset + at, 4).getUint32(0);
@@ -100,8 +102,10 @@ const goos = (): string => ({ win32: "windows" } as Record<string, string>)[proc
 export class Node {
   readonly id: Identity;
   readonly trust: Trust;
-  /** onEvent receives tool events (except tool 0) from known devices. */
-  onEvent?: (peer: string, tool: number, event: number, args: Uint8Array[]) => void;
+  /** onEvent receives tool events (except tool 0) from known devices: in the order sent on each
+   * stream, one at a time, together with that stream's calls (spec §6); a returned promise is
+   * awaited before the next one runs. */
+  onEvent?: (peer: string, tool: number, event: number, args: Uint8Array[]) => void | Promise<void>;
   onPaired?: (p: Peer) => void;
   onHello?: (peer: string) => void;
   /** allowDict decides whether a known device may fetch a dictionary (0.5); unset — all may. */
@@ -169,6 +173,8 @@ export class Node {
     for (const ps of this.peers.values()) for (const c of ps.calls.values()) c.reject(new Error("node closed"));
   }
 
+  /** handle registers method tool.method. Calls of one device on one stream run one at a time,
+   * in the order sent, together with its events there (spec §6); other streams do not wait. */
   handle(tool: number, method: number, h: Handler) {
     this.handlers.set(`${tool}.${method}`, h);
   }
@@ -366,6 +372,7 @@ export class Node {
     s.lastRecv = now;
     if (!this.current.has(s.peer)) this.current.set(s.peer, s);
     const ps = this.peerState(s.peer)!;
+    ps.heard = true;
     this.seen(ps, from, now, s.local);
     ps.st.receive(now, plain, (m, z, st) => this.inbound(s.peer, m, z, st));
     if (ps.st.ackDue !== 0 && now >= ps.st.ackDue) this.wake();
@@ -392,7 +399,10 @@ export class Node {
     this.seen(ps, from, now, s.local);
     this.bootOf(ps, u32(payload, 8));
     from.road.send(from.addr, concat(Uint8Array.of(pResp), be32(s.remote), be32(local), resp));
-    if (payload.length > 12) ps.st.receive(now, payload.subarray(12), (m, z, st) => this.inbound(peer, m, z, st));
+    // data in the first packet; from a device that has not heard our boot id it may be
+    // numbered for our previous boot, to be renumbered once it gets our reply: drop it
+    // unacknowledged, it comes again in the session
+    if (payload.length > 12 && ps.heard) ps.st.receive(now, payload.subarray(12), (m, z, st) => this.inbound(peer, m, z, st));
     this.sendInfo(peer);
   }
 
@@ -410,6 +420,7 @@ export class Node {
     this.current.set(h.peer!, s);
     this.handshakes++;
     const ps = this.peerState(h.peer!)!;
+    ps.heard = true;
     this.seen(ps, from, now, s.local);
     this.bootOf(ps, u32(payload, 0));
     this.sendInfo(h.peer!);
@@ -527,7 +538,8 @@ export class Node {
       if (tool !== 0) this.hear(peer, msg);
       const h = this.handlers.get(`${tool}.${decode(a[3])}`);
       const args = a.slice(4);
-      void (async () => {
+      const boot = ps.boot;
+      const run = async () => {
         let out: unknown[];
         if (!h) out = [2, id, ErrNoMethod, "no such method"];
         else {
@@ -538,9 +550,12 @@ export class Node {
             out = [2, id, err.code, err.message];
           }
         }
+        // the result goes back on the call's stream, unless the caller restarted meanwhile
         const ps2 = this.peerState(peer);
-        if (ps2) this.push(ps2, encode(out), stream, tool !== 0); // the result goes back on the call's stream
-      })();
+        if (ps2 && (boot === 0 || ps2.boot === boot)) this.push(ps2, encode(out), stream, tool !== 0, true);
+      };
+      if (tool === 0) void run(); // service calls (a dictionary, a ping) never wait behind a slow handler
+      else this.enqueue(ps, stream, run);
     } else if (kind === 1 || kind === 2) {
       const id = decode(a[1]) as number;
       const c = ps.calls.get(id);
@@ -571,11 +586,35 @@ export class Node {
         return;
       }
       if (tool !== 0) this.hear(peer, msg);
-      if (this.onEvent) {
+      const on = this.onEvent;
+      if (on) {
         const args = a.slice(3);
-        queueMicrotask(() => this.onEvent!(peer, tool, ev, args));
+        this.enqueue(ps, stream, () => on(peer, tool, ev, args));
       }
     }
+  }
+
+  /** enqueue runs f behind the stream's earlier calls and events, one at a time, in the order
+   * they came (spec §6). Each stream drains on its own: a slow handler holds up its stream only. */
+  private enqueue(ps: PeerState, stream: number, f: () => Promise<void> | void) {
+    const q = ps.inbox.get(stream);
+    if (q) {
+      q.push(f);
+      return;
+    }
+    const queue = [f];
+    ps.inbox.set(stream, queue);
+    void (async () => {
+      await Promise.resolve(); // never inside the caller: as an event handler would run
+      for (let g = queue.shift(); g; g = queue.shift()) {
+        try {
+          await g();
+        } catch {
+          /* an app's handler failing does not stop its stream */
+        }
+      }
+      ps.inbox.delete(stream);
+    })();
   }
 
   // --- sending ---
@@ -584,8 +623,8 @@ export class Node {
     let ps = this.peers.get(peer);
     if (!ps) {
       if (!this.trust.get(peer)) return undefined;
-      ps = { addr: peer, st: new Stream(), eps: new Map(), lastTS: 0n, boot: 0, lastInit: 0, calls: new Map(), callID: 0, dicts: [],
-        lacks: [], waiting: [], fetching: false, tried: [], sysCalls: new Set() };
+      ps = { addr: peer, st: new Stream(), eps: new Map(), lastTS: 0n, boot: 0, heard: false, lastInit: 0, calls: new Map(), callID: 0, dicts: [],
+        lacks: [], waiting: [], fetching: false, tried: [], sysCalls: new Set(), inbox: new Map() };
       this.peers.set(peer, ps);
     }
     return ps;
@@ -734,18 +773,19 @@ export class Node {
   /** push queues a message, compressed when worth it: with our dictionary for this device, else
    * the newest one it also has. The slot refers to our list at send time: the list changes only
    * through event 0.5, which travels in the same order as messages. talk: the message is
-   * conversation (not tool 0), so it goes to the history (learn.ts). */
-  private push(ps: PeerState, msg: Uint8Array, stream = 0, talk = false) {
+   * conversation (not tool 0), so it goes to the history (learn.ts); reply: a result or error,
+   * dropped if the other device restarts (spec §4.2). */
+  private push(ps: PeerState, msg: Uint8Array, stream = 0, talk = false, reply = false) {
     if (this.noCompression) {
-      ps.st.push(msg, false, stream);
+      ps.st.push(msg, false, stream, reply);
       this.wake();
       return;
     }
     const [d, slot] = this.dicts.pick(ps.addr, ps.dicts, ps.lacks);
     const z = compress(msg, d, slot);
     if (talk && !this.noLearning) this.learner.talk(ps.addr, msg, d, z);
-    if (z) ps.st.push(z, true, stream);
-    else ps.st.push(msg, false, stream);
+    if (z) ps.st.push(z, true, stream, reply);
+    else ps.st.push(msg, false, stream, reply);
     this.wake();
   }
 

@@ -37,7 +37,9 @@ interface Part {
   stream: number;
   num: number;
   firstOfStream: boolean;
-  first: number; // first sent at, ms (0 — not yet)
+  reply: boolean; // part of a result or error: it answers a call of this boot only
+  copies: number[]; // when each copy was sent, ms
+  timer: boolean; // the last copy went because the timer ran out
   sent: number;
   tries: number;
   delivered: number; // bytes delivered when sent: its ack gives a delivery-rate sample
@@ -168,7 +170,9 @@ export class Stream {
     this.cwnd = this.ssthresh;
   }
 
-  /** reset handles a restart of the other device: renumber what we have, receive from 1. */
+  /** reset handles a restart of the other device: renumber what we have, receive from 1.
+   * Replies are dropped: the calls they answer ended with the restart, and the new call ids
+   * start from 1 again, so a stale reply would answer a new call. */
   reset() {
     const pending = [...this.inflight.values()].sort((a, b) => a.seq - b.seq).concat(this.queue);
     this.next = 1;
@@ -176,8 +180,15 @@ export class Stream {
     this.inflightBytes = 0;
     this.queue = [];
     this.resetRecv();
+    // the path may be another one now: measure it afresh (a stale minimum round trip would
+    // read every round trip as a queue, or every ack of a retransmission as a real one)
+    this.cwnd = cwndStart;
+    this.ssthresh = cwndMax;
+    this.lastCut = 0;
+    this.srtt = this.rttvar = this.minRTT = this.bw = this.bwAt = 0;
     for (const p of pending) {
-      Object.assign(p, { seq: this.next++, first: 0, sent: 0, tries: 0, delivered: 0 });
+      if (p.reply) continue;
+      Object.assign(p, { seq: this.next++, copies: [], timer: false, sent: 0, tries: 0, delivered: 0 });
       if (p.firstOfStream) {
         const n = (this.snext.get(p.stream) ?? 0) + 1;
         this.snext.set(p.stream, n);
@@ -187,8 +198,9 @@ export class Stream {
     }
   }
 
-  /** push queues a message in parts on a stream (0 — the ordered default); zip — compressed. */
-  push(msg: Uint8Array, zip: boolean, stream = 0) {
+  /** push queues a message in parts on a stream (0 — the ordered default); zip — compressed,
+   * reply — a result or error. */
+  push(msg: Uint8Array, zip: boolean, stream = 0, reply = false) {
     let num = 0;
     if (stream !== 0) {
       num = (this.snext.get(stream) ?? 0) + 1;
@@ -199,7 +211,7 @@ export class Stream {
     do {
       const n = Math.min(msg.length - off, maxPart);
       this.queue.push({ seq: this.next++, data: msg.subarray(off, off + n), more: off + n < msg.length, zip,
-        stream, num: first ? num : 0, firstOfStream: stream !== 0 && first, first: 0, sent: 0, tries: 0, delivered: 0 });
+        stream, num: first ? num : 0, firstOfStream: stream !== 0 && first, reply, copies: [], timer: false, sent: 0, tries: 0, delivered: 0 });
       first = false;
       off += n;
     } while (off < msg.length);
@@ -216,6 +228,7 @@ export class Stream {
     let retry = false;
     if (p) {
       retry = true;
+      p.timer = p.sent !== 0; // not taken as lost by an ack: the timer ran out
       this.lost(now);
     } else if (this.queue.length > 0 && this.canSend()) {
       p = this.queue.shift()!;
@@ -245,7 +258,7 @@ export class Stream {
         putUvarint(b, p.num);
       } else if (p.stream !== 0) flags |= fCont;
       data = p.data;
-      if (p.first === 0) p.first = now;
+      p.copies.push(now);
       p.delivered = this.delivered;
       p.sent = now;
       p.tries++;
@@ -297,7 +310,18 @@ export class Stream {
       const ack = (seq: number) => {
         const p = this.inflight.get(seq);
         if (!p) return;
-        if (p.sent > newest) newest = p.sent;
+        // an ack sooner than the minimum round trip after a timer's copy is for an earlier copy:
+        // the timer fired on a queue, not a loss (RFC 8985 §6.2). The newest copy's time would
+        // declare every part sent between the copies lost. The ack is not ambiguous, so it is a
+        // round-trip sample (Karn's rule skips it otherwise).
+        let sent = p.sent;
+        if (p.timer && now - p.sent < this.minRTT) {
+          p.copies.forEach((c, i) => {
+            if (i === 0 || now - c >= this.minRTT) sent = c;
+          });
+          this.sample(now - sent);
+        }
+        if (sent > newest) newest = sent;
         this.delivered += p.data.length;
         if (p.tries === 1) {
           this.sample(now - p.sent);
