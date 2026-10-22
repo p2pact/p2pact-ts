@@ -27,8 +27,26 @@ export class P2PACTError extends Error {
   }
 }
 
-/** Handler is a tool method: raw CBOR arguments → result values. */
-export type Handler = (peer: string, args: Uint8Array[]) => CborValue[] | Promise<CborValue[]>;
+/** Handler is a tool method: raw CBOR arguments → result values. Its call's turn on the stream
+ * lasts until the returned promise settles; a handler that waits long returns {@link later}. */
+export type Handler = (peer: string, args: Uint8Array[]) => CborValue[] | Later | Promise<CborValue[] | Later>;
+
+/** Later is a reply taken out of the stream's turn: see {@link later}. */
+export class Later {
+  /** @internal */
+  constructor(readonly reply: PromiseLike<CborValue[]>) {}
+}
+
+/** later answers a call later (spec §6): a handler returns later(reply), its turn on the stream
+ * ends there, so the stream's next calls and events run (a cancel among them), and the call's
+ * result or error goes when reply settles — unless the caller restarted meanwhile.
+ *
+ *     node.handle(1, 1, (peer, args) => later(runTurn(args)));
+ */
+export function later(reply: PromiseLike<CborValue[]>): Later {
+  Promise.resolve(reply).catch(() => {}); // a rejection is the call's error, handled when the turn ends
+  return new Later(reply);
+}
 
 class Window {
   private top = 0n;
@@ -174,7 +192,8 @@ export class Node {
   }
 
   /** handle registers method tool.method. Calls of one device on one stream run one at a time,
-   * in the order sent, together with its events there (spec §6); other streams do not wait. */
+   * in the order sent, together with its events there (spec §6); other streams do not wait. A
+   * handler that waits long returns {@link later}, so that the stream goes on without it. */
   handle(tool: number, method: number, h: Handler) {
     this.handlers.set(`${tool}.${method}`, h);
   }
@@ -539,20 +558,28 @@ export class Node {
       const h = this.handlers.get(`${tool}.${decode(a[3])}`);
       const args = a.slice(4);
       const boot = ps.boot;
-      const run = async () => {
+      const reply = async (res: CborValue[] | PromiseLike<CborValue[]>) => {
         let out: unknown[];
-        if (!h) out = [2, id, ErrNoMethod, "no such method"];
-        else {
-          try {
-            out = [1, id, ...(await h(peer, args))];
-          } catch (e) {
-            const err = e instanceof P2PACTError ? e : new P2PACTError(ErrFailed, (e as Error).message);
-            out = [2, id, err.code, err.message];
-          }
+        try {
+          out = [1, id, ...(await res)];
+        } catch (e) {
+          const err = e instanceof P2PACTError ? e : new P2PACTError(ErrFailed, (e as Error).message);
+          out = [2, id, err.code, err.message];
         }
         // the result goes back on the call's stream, unless the caller restarted meanwhile
         const ps2 = this.peerState(peer);
         if (ps2 && (boot === 0 || ps2.boot === boot)) this.push(ps2, encode(out), stream, tool !== 0, true);
+      };
+      const run = async () => {
+        if (!h) return reply(Promise.reject(new P2PACTError(ErrNoMethod, "no such method")));
+        let res: CborValue[] | Later;
+        try {
+          res = await h(peer, args);
+        } catch (e) {
+          return reply(Promise.reject(e));
+        }
+        if (res instanceof Later) void reply(res.reply); // the turn ends here; the reply goes when ready
+        else return reply(res);
       };
       if (tool === 0) void run(); // service calls (a dictionary, a ping) never wait behind a slow handler
       else this.enqueue(ps, stream, run);

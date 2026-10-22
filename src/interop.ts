@@ -7,6 +7,10 @@
 //   {"cmd":"join","invite":"…"}                               → {"peer":"…"}
 //   {"cmd":"known","peer":"…"}                                → {"known":true|false}
 //   {"cmd":"call","peer":"…","data":"<base64>"}               → {"data":"<base64>"}  (echo, tool 64 method 1)
+//   {"cmd":"later","peer":"…","data":"<base64>","stream":N}   → {"data":"<base64>"}
+//     a call answered later (spec §6): calls tool 64 method 2 on the stream, which the other side
+//     holds until a 64.1 call reaches it, then a 64.1 call on the same stream; answers with the
+//     64.2 result, or an error if the 64.1 call waited behind the held one
 //   {"cmd":"dict","raw":"<base64>"}                           → {"ok":true}
 //   {"cmd":"dict-state","peer":"…"}                           → {"own":"<base64>"|null,"using":…,"training":bool}
 //   {"cmd":"close"}
@@ -16,12 +20,29 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { createInterface } from "node:readline";
 import { decode } from "./cbor.js";
-import { Node } from "./node.js";
+import { ErrFailed, later, Node, P2PACTError } from "./node.js";
 import { Invite } from "./store.js";
 
 const dir = process.argv[2] ?? fs.mkdtempSync(path.join(os.tmpdir(), "p2pact-interop-"));
 const node = new Node(dir, process.argv[3] ?? "ts");
-node.handle(64, 1, (_p, args) => [decode(args[0])]);
+// 64.2 echoes too, but answers later: once a 64.1 call has run after it (on its stream, that call
+// is behind it; it passes only if the held call does not hold up the stream)
+let held: (() => void)[] = [];
+node.handle(64, 1, (_p, args) => {
+  for (const r of held) r();
+  held = [];
+  return [decode(args[0])];
+});
+node.handle(64, 2, (_p, args) => {
+  const data = decode(args[0]);
+  return later(new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new P2PACTError(ErrFailed, "no call came behind")), 30_000);
+    held.push(() => {
+      clearTimeout(t);
+      resolve([data]);
+    });
+  }));
+});
 node.start();
 
 const say = (v: unknown) => process.stdout.write(JSON.stringify(v) + "\n");
@@ -55,6 +76,18 @@ for await (const line of createInterface({ input: process.stdin })) {
       case "call": {
         const res = await node.callOn(req.peer, Number(req.stream ?? 0), 64, 1, new Uint8Array(Buffer.from(req.data, "base64")));
         say({ data: b64(decode(res[0]) as Uint8Array) });
+        break;
+      }
+      case "later": {
+        const data = new Uint8Array(Buffer.from(req.data, "base64"));
+        const stream = Number(req.stream ?? 0);
+        const timeout = <T>(p: Promise<T>, ms: number, what: string) =>
+          Promise.race([p, new Promise<never>((_, rej) => setTimeout(() => rej(new Error(what + ": no answer")), ms).unref())]);
+        const first = timeout(node.callOn(req.peer, stream, 64, 2, data), 20_000, "the held call");
+        first.catch(() => {});
+        await new Promise((r) => setTimeout(r, 100)); // the held call goes first
+        await timeout(node.callOn(req.peer, stream, 64, 1, new TextEncoder().encode("behind")), 10_000, "the call behind the held one");
+        say({ data: b64(decode((await first)[0]) as Uint8Array) });
         break;
       }
       case "dict":

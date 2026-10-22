@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { decode, encode, decodeArrayRaw, Invite, Node, P2PACTError, ErrNoMethod } from "../src/index.js";
+import { decode, encode, decodeArrayRaw, Invite, Node, P2PACTError, ErrNoMethod, later } from "../src/index.js";
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "p2pact-ts-"));
 
@@ -143,6 +143,42 @@ test("a stream's calls and events run in order", async () => {
     await within(all, 10_000);
     assert.equal(got[total - 1], 0);
     for (let i = 1; i < total; i++) assert.equal(got[i - 1], i, `out of order at ${i}`);
+  } finally {
+    a.close();
+    b.close();
+  }
+});
+
+// A handler that answers later lets its stream go on: an event and a call sent behind it run
+// (in the order sent) while it waits, and its result comes when ready (spec §6).
+test("a call answered later does not hold up its stream", async () => {
+  const a = await node("Laptop", { udp: true }), b = await node("Phone", { udp: true });
+  try {
+    await pair(a, b);
+    let release!: (v: string[]) => void;
+    const turn = new Promise<string[]>((r) => (release = r));
+    const started: string[] = [];
+    b.handle(64, 2, async () => { // an agent's turn
+      started.push("long");
+      return later(turn);
+    });
+    b.handle(64, 3, () => {
+      started.push("call");
+      return ["quick"];
+    });
+    b.handle(64, 4, () => later(Promise.reject(new P2PACTError(4, "no")))); // an error, later
+    b.onEvent = () => void started.push("event");
+    let answered = false;
+    const long = a.callOn(b.id.addr, 2, 64, 2).then((r) => ((answered = true), r));
+    await sleep(50);
+    a.eventOn(b.id.addr, 2, 64, 1); // a cancel, say
+    const quick = await within(a.callOn(b.id.addr, 2, 64, 3), 3_000);
+    assert.equal(decode(quick[0]), "quick");
+    assert.deepEqual(started, ["long", "event", "call"]);
+    assert.ok(!answered, "the long call was answered before it was done");
+    release(["done"]);
+    assert.equal(decode((await within(long, 5_000))[0]), "done");
+    await assert.rejects(within(a.callOn(b.id.addr, 2, 64, 4), 3_000), (e: P2PACTError) => e.code === 4);
   } finally {
     a.close();
     b.close();
