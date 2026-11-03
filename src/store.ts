@@ -3,6 +3,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { decode, encode, type CborValue } from "./cbor.js";
+import { cleanGrants, defaultGrants, type Grant } from "./grants.js";
 import { address, ed25519Keypair, mac, randomBytes, x25519, x25519Keypair, type KeyPair } from "./crypto.js";
 
 export const Prologue = "p2pact/1";
@@ -73,7 +74,22 @@ export interface Peer {
   signKey?: Uint8Array;
   os?: string;
   via?: string;
+  /** what the device is for (KindComputer…); 0 or undefined — not said */
+  kind?: number;
+  /** what we let this device use of ours (spec §8.1); undefined — never set, which is ["*", 2]:
+   * a person's own device uses everything. An empty list grants nothing. */
+  grants?: Grant[];
+  /** what the device lets us use of its tools (its event 0.6); undefined — not told, ["*", 2] too */
+  granted?: Grant[];
+  /** we reach the device over our local socket (a plugin's host, spec §3) */
+  local?: boolean;
 }
+
+/** allowed is what we let the device use of ours (spec §8.1); the default if never set. */
+export const allowed = (p: Peer): Grant[] => (p.grants ? p.grants.map((g) => ({ ...g })) : defaultGrants());
+
+/** offered is what the device lets us use of its tools, as it told us; the default if it never did. */
+export const offered = (p: Peer): Grant[] => (p.granted ? p.granted.map((g) => ({ ...g })) : defaultGrants());
 
 /** phone reports a phone OS: a phone is never the family parent. */
 export const phone = (os?: string) => os === "android" || os === "ios";
@@ -114,7 +130,10 @@ export class Trust {
           addr: j.addr as string, key: unb64(j.key as string), name: (j.name as string) ?? "",
           pairSecret: unb64((j.pair_secret as string) ?? ""), hints: (j.hints as Hints) ?? {}, added: (j.added as number) ?? 0,
           signKey: j.sign_key ? unb64(j.sign_key as string) : undefined, os: j.os as string | undefined,
-          via: j.via as string | undefined,
+          via: j.via as string | undefined, kind: (j.kind as number | undefined) || undefined,
+          grants: Array.isArray(j.grants) ? cleanGrants(j.grants as Grant[]) : undefined,
+          granted: Array.isArray(j.granted) ? cleanGrants(j.granted as Grant[]) : undefined,
+          local: j.local ? true : undefined,
         };
         if (p.key.length === 32 && address(p.key) === p.addr) this.peers.set(p.addr, p);
       }
@@ -148,6 +167,32 @@ export class Trust {
     this.save();
   }
 
+  /** setKind stores the kind a device told in its hello. */
+  setKind(addr: string, kind: number) {
+    const p = this.peers.get(addr);
+    if (p && (p.kind ?? 0) !== kind) {
+      p.kind = kind || undefined;
+      this.save();
+    }
+  }
+
+  /** setGrants stores what we let a known device use; false — no such device. */
+  setGrants(addr: string, g: Grant[]): boolean {
+    const p = this.peers.get(addr);
+    if (!p) return false;
+    p.grants = g.map((x) => ({ ...x }));
+    this.save();
+    return true;
+  }
+
+  /** setGranted stores what a known device told us we may use of its tools. */
+  setGranted(addr: string, g: Grant[]) {
+    const p = this.peers.get(addr);
+    if (!p) return;
+    p.granted = g.map((x) => ({ ...x }));
+    this.save();
+  }
+
   remove(addr: string): boolean {
     const had = this.peers.delete(addr);
     if (had) this.save();
@@ -158,6 +203,8 @@ export class Trust {
     const list = this.list().map((p) => ({
       addr: p.addr, key: b64(p.key), name: p.name, pair_secret: b64(p.pairSecret), hints: p.hints, added: p.added,
       ...(p.signKey ? { sign_key: b64(p.signKey) } : {}), ...(p.os ? { os: p.os } : {}), ...(p.via ? { via: p.via } : {}),
+      ...(p.kind ? { kind: p.kind } : {}), ...(p.grants ? { grants: p.grants } : {}),
+      ...(p.granted ? { granted: p.granted } : {}), ...(p.local ? { local: true } : {}),
     }));
     fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
     // replaced in one step: a node starting meanwhile never reads it half-written

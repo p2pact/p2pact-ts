@@ -117,6 +117,43 @@ interface PeerState {
   inbox: Map<number, (() => Promise<void> | void)[]>; // calls and events waiting for their turn, per stream
 }
 
+/** Kinds of device (spec §1): what a device is for, told in the pairing payload and the hello. */
+export const KindUnknown = 0; // not said (an older device): guess as before, e.g. by OS
+export const KindComputer = 1; // runs agents, serves tools
+export const KindClient = 2; // an app a person holds: a phone, a desktop or web app
+export const KindPlugin = 3; // a program on the same computer that adds tools to it
+
+/** pairInfo is the pairing handshake payload [name, boot, hints, signing key, os, kind, wants]:
+ * the last two are optional and a shorter one (an older device) leaves them zero; more elements
+ * than we know are ignored. */
+export interface PairInfo {
+  name: string;
+  boot: number;
+  hints: Hints;
+  signKey?: Uint8Array;
+  os?: string;
+  kind: number;
+}
+
+/** @internal */
+export function parsePair(b: Uint8Array): PairInfo {
+  let a: CborValue[] = [];
+  try {
+    const v = decode(b);
+    if (Array.isArray(v)) a = v;
+  } catch {
+    /* an unreadable payload reads as empty */
+  }
+  return {
+    name: String(a[0] ?? ""),
+    boot: typeof a[1] === "number" ? a[1] : 0,
+    hints: hintsFromWire(a[2] ?? null),
+    signKey: a[3] instanceof Uint8Array ? a[3] : undefined,
+    os: typeof a[4] === "string" ? a[4] : undefined,
+    kind: typeof a[5] === "number" ? a[5] : KindUnknown,
+  };
+}
+
 const u32 = (b: Uint8Array, at: number) => new DataView(b.buffer, b.byteOffset + at, 4).getUint32(0);
 const be32 = (v: number) => {
   const b = new Uint8Array(4);
@@ -143,6 +180,8 @@ export class Node {
   noCompression = false;
   /** noLearning: do not train our own dictionaries on what we send (spec §5). */
   noLearning = false;
+  /** kind is what this device is for (KindComputer…), told in pairing and the hello (spec §1). */
+  kind = KindUnknown;
 
   private boot = u32(randomBytes(4), 0) || 1;
   private udp?: UDPRoad;
@@ -250,8 +289,11 @@ export class Node {
     }
   }
 
+  /** pairPayload is our payload; a device that does not say its kind sends the old five fields. */
   private pairPayload(): Uint8Array {
-    return encode([this.name, this.boot, hintsToWire(this.hints()), this.id.sign.public, goos()]);
+    const a: CborValue[] = [this.name, this.boot, hintsToWire(this.hints()), this.id.sign.public, goos()];
+    if (this.kind !== KindUnknown) a.push(this.kind);
+    return encode(a);
   }
 
   /** befriend adds a device known from the family book, without pairing. */
@@ -259,7 +301,7 @@ export class Node {
     if (p.key.length !== 32 || address(p.key) !== p.addr) throw new Error("key does not match address");
     const old = this.trust.get(p.addr);
     if (old) {
-      this.trust.put({ ...old, name: p.name, signKey: p.signKey, os: p.os });
+      this.trust.put({ ...old, name: p.name, signKey: p.signKey, os: p.os, kind: p.kind ? p.kind : old.kind });
       return;
     }
     this.trust.put({ ...p, pairSecret: this.id.shared(p.key, "family-pair") });
@@ -335,7 +377,7 @@ export class Node {
       const t = Number(k.split(".")[0]);
       if (t !== 0) tools.set(t, 1);
     }
-    return [this.name, goos(), "p2pact-ts", tools, this.dicts.ids(peer), hintsToWire(this.hints())];
+    return [this.name, goos(), "p2pact-ts", tools, this.dicts.ids(peer), hintsToWire(this.hints()), this.kind];
   }
 
   private hints(): Hints {
@@ -489,24 +531,24 @@ export class Node {
       h.done.reject(new Error("device key does not match the invite"));
       return;
     }
-    const pp = decode(payload) as CborValue[];
+    const pp = parsePair(payload);
     const msg3 = h.hs.writeMessage(this.pairPayload());
     const [c1, c2] = h.hs.ciphers!;
     this.hs.delete(local);
     const peer = address(inv.key);
-    const hints = hintsFromWire(pp[2] ?? null);
+    const hints = pp.hints;
     hints.udp ??= inv.hints.udp;
     hints.tcp ??= inv.hints.tcp;
     hints.relay ??= inv.hints.relay;
-    const p: Peer = { addr: peer, key: inv.key, name: String(pp[0] ?? ""), pairSecret: inv.secret, hints, added: 0,
-      signKey: pp[3] instanceof Uint8Array ? pp[3] : undefined, os: typeof pp[4] === "string" ? pp[4] : undefined };
+    const p: Peer = { addr: peer, key: inv.key, name: pp.name, pairSecret: inv.secret, hints, added: 0,
+      signKey: pp.signKey, os: pp.os, kind: pp.kind || undefined };
     this.trust.put(p);
     const s: Session = { peer, local, remote: u32(pkt, 5), send: c1, recv: c2, sendN: 0, win: new Window(), lastRecv: now };
     this.sessions.set(local, s);
     this.current.set(peer, s);
     const ps = this.peerState(peer)!;
     this.seen(ps, from, now, s.local);
-    this.bootOf(ps, Number(pp[1] ?? 0));
+    this.bootOf(ps, pp.boot);
     from.road.send(from.addr, concat(Uint8Array.of(pPair3), be32(s.remote), msg3));
     this.paired(p);
     h.done.resolve();
@@ -524,17 +566,16 @@ export class Node {
     this.invites.delete(hex(inv.id)); // single use
     const key = h.hs.rs!;
     const peer = address(key);
-    const pp = decode(payload) as CborValue[];
-    const p: Peer = { addr: peer, key: key.slice(), name: String(pp[0] ?? ""), pairSecret: inv.secret,
-      hints: hintsFromWire(pp[2] ?? null), added: 0, signKey: pp[3] instanceof Uint8Array ? pp[3] : undefined,
-      os: typeof pp[4] === "string" ? pp[4] : undefined, via: hex(inv.id) };
+    const pp = parsePair(payload);
+    const p: Peer = { addr: peer, key: key.slice(), name: pp.name, pairSecret: inv.secret,
+      hints: pp.hints, added: 0, signKey: pp.signKey, os: pp.os, kind: pp.kind || undefined, via: hex(inv.id) };
     this.trust.put(p);
     const s: Session = { peer, local, remote: h.remoteIdx!, send: c2, recv: c1, sendN: 0, win: new Window(), lastRecv: now };
     this.sessions.set(local, s);
     this.current.set(peer, s);
     const ps = this.peerState(peer)!;
     this.seen(ps, from, now, s.local);
-    this.bootOf(ps, Number(pp[1] ?? 0));
+    this.bootOf(ps, pp.boot);
     this.paired(p);
   }
 
@@ -615,6 +656,10 @@ export class Node {
       const ev = decode(a[2]) as number;
       if (tool === 0 && ev === 2 && a.length >= 9) {
         this.trust.setHints(peer, String(decode(a[3]) ?? ""), String(decode(a[4]) ?? ""), hintsFromWire(decode(a[8])));
+        if (a.length >= 10) {
+          const kind = decode(a[9]);
+          if (typeof kind === "number") this.trust.setKind(peer, kind);
+        }
         ps.dicts = idsOf(decode(a[7]));
         ps.lacks = [];
         ps.tried = [];
