@@ -12,6 +12,14 @@ over UDP and TCP, compressed and not — checked by the interop tests in
 No runtime dependencies: X25519, Ed25519, ChaCha20-Poly1305, BLAKE2s and zstd all come from
 Node's own `crypto` and `zlib` (Node 22.15+). Noise and CBOR are implemented here.
 
+## Install
+
+```sh
+npm i p2pact
+```
+
+Node 22.15+. The client SDK is imported from `p2pact/client`.
+
 ## Use
 
 ```ts
@@ -94,6 +102,15 @@ npm test
 Own dictionaries are trained in a worker thread: the content by fastCover (the algorithm of
 `zstd --train`, as p2pact-go), the entropy tables taken from the common dictionary — Node's
 zstd has no trainer, and any valid zstd dictionary works, since only its owner compresses with it.
+
+## Publishing
+
+For maintainers. `.github/workflows/publish.yml` runs on a `v*` tag (or by hand): build, unit
+tests, then `npm publish --provenance --access public`. Before the first tag:
+
+- npm: create an automation (or granular, publish-enabled) access token and save it as the
+  repository secret `NPM_TOKEN`.
+- The tag must equal `v` + `version` from `package.json`: `git tag v0.1.0 && git push origin v0.1.0`.
 
 ## License
 
