@@ -8,7 +8,8 @@
 // `net` opens the same way. Node only: the browser has no such road.
 import * as fs from "node:fs";
 import * as net from "node:net";
-import { TCPRoad, type Endpoint } from "./roads.js";
+import { TCPRoad } from "./roads-node.js";
+import type { Endpoint } from "./roads.js";
 
 /** isPipePath reports a Windows named pipe path (\\.\pipe\name). */
 const isPipePath = (path: string) => process.platform === "win32" && /^\\\\[.?]\\pipe\\/i.test(path);

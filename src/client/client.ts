@@ -83,9 +83,11 @@ export class P2pactClient {
     });
   }
 
-  /** open makes the node in `dir` and runs it: listens on the roads of `config`, ready to pair. */
+  /** open makes the node in `dir` and runs it: listens on the roads of `config`, ready to pair.
+   * Node.js only (a browser builds its node itself and uses {@link P2pactClient.wrap}). */
   static async open(dir: string, name: string, config: ClientConfig = {}): Promise<P2pactClient> {
-    const node = new Node(dir, name);
+    const { Node: FsNode } = await import("../node-fs.js");
+    const node = new FsNode(dir, name);
     node.kind = KindClient;
     const c = new P2pactClient(node, withDefaults(config), true);
     try {

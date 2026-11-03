@@ -1,16 +1,16 @@
-// Device identity, known devices and invites (spec §1, §2). Files use the same format as the
-// Go implementation: dir/net-key.json and dir/net-peers.json.
-import * as fs from "node:fs";
-import * as path from "node:path";
+// Device identity, known devices and invites (spec §1, §2). Blobs use the same format as the
+// Go implementation: net-key.json and net-peers.json (in a directory, with FileStorage).
+import { fromBase64, hex, toBase64, toBase64Url } from "./bytes.js";
 import { decode, encode, type CborValue } from "./cbor.js";
+import { readText, writeText, type Storage } from "./storage.js";
 import { cleanGrants, defaultGrants, type Grant } from "./grants.js";
 import { address, ed25519Keypair, mac, randomBytes, x25519, x25519Keypair, type KeyPair } from "./crypto.js";
 
 export const Prologue = "p2pact/1";
 const invitePrefix = "p2pact1.";
 
-const b64 = (b: Uint8Array) => Buffer.from(b).toString("base64");
-const unb64 = (s: string) => new Uint8Array(Buffer.from(s, "base64"));
+const b64 = toBase64;
+const unb64 = fromBase64;
 
 export class Identity {
   constructor(readonly key: KeyPair, readonly sign: KeyPair) {}
@@ -24,12 +24,11 @@ export class Identity {
     return mac(x25519(this.key.private, pub), label);
   }
 
-  /** load reads dir/net-key.json, creating keys (owner-only) when missing. */
-  static load(dir: string): Identity {
-    const file = path.join(dir, "net-key.json");
+  /** load reads net-key.json, creating keys when missing. */
+  static load(st: Storage): Identity {
     let f: { private?: string; public?: string; sign?: string } = {};
     try {
-      f = JSON.parse(fs.readFileSync(file, "utf8"));
+      f = JSON.parse(readText(st, "net-key.json") ?? "");
     } catch {
       /* new device */
     }
@@ -44,10 +43,7 @@ export class Identity {
       f.sign = b64(randomBytes(32));
       changed = true;
     }
-    if (changed) {
-      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-      fs.writeFileSync(file, JSON.stringify(f), { mode: 0o600 });
-    }
+    if (changed) writeText(st, "net-key.json", JSON.stringify(f));
     const key = x25519Keypair(unb64(f.private));
     return new Identity(key, ed25519Keypair(unb64(f.sign)));
   }
@@ -62,6 +58,8 @@ export interface Hints {
   udp?: string[];
   tcp?: string[];
   relay?: RelayHint;
+  /** WebSocket URLs of a relay (wss://…): what a browser dials */
+  ws?: string[];
 }
 
 export interface Peer {
@@ -95,12 +93,15 @@ export const offered = (p: Peer): Grant[] => (p.granted ? p.granted.map((g) => (
 export const phone = (os?: string) => os === "android" || os === "ios";
 
 export function relayChannel(p: Peer): string {
-  return Buffer.from(mac(p.pairSecret, "relay").subarray(0, 16)).toString("hex");
+  return hex(mac(p.pairSecret, "relay").subarray(0, 16));
 }
 
-/** hintsWire is [UDP addresses, [relay address, fingerprint], TCP addresses]. */
+/** hintsWire is [UDP addresses, [relay address, fingerprint], TCP addresses, WebSocket URLs of a
+ * relay]; the fourth element only when there are URLs (older devices read three). */
 export function hintsToWire(h: Hints): CborValue {
-  return [h.udp ?? null, h.relay ? [h.relay.addr, h.relay.fp] : null, h.tcp ?? null];
+  const a: CborValue[] = [h.udp ?? null, h.relay ? [h.relay.addr, h.relay.fp] : null, h.tcp ?? null];
+  if (h.ws?.length) a.push(h.ws);
+  return a;
 }
 
 export function hintsFromWire(v: CborValue): Hints {
@@ -113,18 +114,18 @@ export function hintsFromWire(v: CborValue): Hints {
   if (r && r.length === 2 && r[0]) h.relay = { addr: r[0], fp: r[1] };
   const tcp = strs(a[2]);
   if (tcp?.length) h.tcp = tcp;
+  const ws = strs(a[3]);
+  if (ws?.length) h.ws = ws;
   return h;
 }
 
-/** Trust is the set of known devices in dir/net-peers.json. */
+/** Trust is the set of known devices in net-peers.json. */
 export class Trust {
   private peers = new Map<string, Peer>();
-  private file: string;
 
-  constructor(dir: string) {
-    this.file = path.join(dir, "net-peers.json");
+  constructor(private st: Storage) {
     try {
-      const list = JSON.parse(fs.readFileSync(this.file, "utf8")) as Record<string, unknown>[];
+      const list = JSON.parse(readText(st, "net-peers.json") ?? "") as Record<string, unknown>[];
       for (const j of list) {
         const p: Peer = {
           addr: j.addr as string, key: unb64(j.key as string), name: (j.name as string) ?? "",
@@ -164,6 +165,7 @@ export class Trust {
     if (h.udp?.length) p.hints.udp = h.udp;
     if (h.tcp?.length) p.hints.tcp = h.tcp;
     if (h.relay) p.hints.relay = h.relay;
+    if (h.ws?.length) p.hints.ws = h.ws;
     this.save();
   }
 
@@ -206,10 +208,7 @@ export class Trust {
       ...(p.kind ? { kind: p.kind } : {}), ...(p.grants ? { grants: p.grants } : {}),
       ...(p.granted ? { granted: p.granted } : {}), ...(p.local ? { local: true } : {}),
     }));
-    fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
-    // replaced in one step: a node starting meanwhile never reads it half-written
-    fs.writeFileSync(this.file + ".tmp", JSON.stringify(list, null, 2), { mode: 0o600 });
-    fs.renameSync(this.file + ".tmp", this.file);
+    writeText(this.st, "net-peers.json", JSON.stringify(list, null, 2));
   }
 }
 
@@ -230,7 +229,7 @@ export class Invite {
 
   toString(): string {
     const b = encode([1, this.key, this.name, this.secret, Math.floor(this.exp.getTime() / 1000), hintsToWire(this.hints)]);
-    return invitePrefix + Buffer.from(b).toString("base64url");
+    return invitePrefix + toBase64Url(b);
   }
 
   static parse(s: string): Invite {
@@ -238,7 +237,7 @@ export class Invite {
     if (!s.startsWith(invitePrefix)) throw new Error("not an invite");
     let v: CborValue;
     try {
-      v = decode(new Uint8Array(Buffer.from(s.slice(invitePrefix.length), "base64url")));
+      v = decode(fromBase64(s.slice(invitePrefix.length)));
     } catch {
       throw new Error("invite is corrupt");
     }

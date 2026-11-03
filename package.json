@@ -1,7 +1,7 @@
 {
   "name": "p2pact",
   "version": "0.1.0",
-  "description": "TypeScript implementation of P2PACT — the P2P Agent Chat Transport Protocol: chat with your AI agents across your own devices, no servers.",
+  "description": "TypeScript implementation of P2PACT \u2014 the P2P Agent Chat Transport Protocol: chat with your AI agents across your own devices, no servers.",
   "license": "Apache-2.0",
   "author": "Aidar Babanov",
   "homepage": "https://github.com/p2pact/p2pact-ts#readme",
@@ -34,10 +34,15 @@
       "types": "./dist/src/client/index.d.ts",
       "default": "./dist/src/client/index.js"
     },
+    "./browser": {
+      "types": "./dist/src/browser.d.ts",
+      "default": "./dist/browser/p2pact.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
     "dist/src",
+    "dist/browser",
     "dict",
     "README.md",
     "LICENSE"
@@ -53,12 +58,21 @@
     "provenance": true
   },
   "scripts": {
-    "build": "tsc -p .",
+    "build": "tsc -p . && node scripts/build-browser.mjs",
     "test": "tsc -p . && node --test dist/test/",
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "esbuild": "^0.28.2",
+    "fake-indexeddb": "^6.2.7",
+    "playwright-core": "^1.64.1",
     "typescript": "^5.6.3"
+  },
+  "dependencies": {
+    "@noble/ciphers": "^2.4.0",
+    "@noble/curves": "^2.4.0",
+    "@noble/hashes": "^2.4.0",
+    "zstd-wasm-decoder": "^0.2.3"
   }
 }

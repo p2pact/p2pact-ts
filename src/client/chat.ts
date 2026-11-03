@@ -1,6 +1,6 @@
 // Tool 1 `p2pact.chat`: ACP over P2PACT with the `_p2pact/<name>` extensions (chat spec).
-import { randomBytes } from "node:crypto";
 import type { CborValue } from "../cbor.js";
+import { hex, randomBytes } from "../crypto.js";
 import { decode } from "../cbor.js";
 import type { StreamId } from "../delivery.js";
 import {
@@ -314,7 +314,7 @@ export class ChatClient {
   }
 }
 
-const newMid = () => randomBytes(8).toString("hex");
+const newMid = () => hex(randomBytes(8));
 
 const result = (r: unknown): CborValue[] => [wire({ jsonrpc: "2.0", result: r })];
 

@@ -1,4 +1,5 @@
 import { test } from "node:test";
+import { FileStorage } from "../src/storage-node.js";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -28,12 +29,12 @@ test("grants default", async () => {
     const list = a.trust.list().map((p) => ({ addr: p.addr, key: Buffer.from(p.key).toString("base64"), name: p.name,
       pair_secret: Buffer.from(p.pairSecret).toString("base64"), hints: p.hints, added: p.added }));
     fs.writeFileSync(path.join(dir, "net-peers.json"), JSON.stringify(list));
-    const p = new Trust(dir).get(b.id.addr);
+    const p = new Trust(new FileStorage(dir)).get(b.id.addr);
     assert.ok(p && p.grants === undefined);
     assert.deepEqual(allowed(p), defaultGrants());
     // a file written by the Go library has "grants": null
     fs.writeFileSync(path.join(dir, "net-peers.json"), JSON.stringify(list.map((x) => ({ ...x, grants: null }))));
-    assert.equal(new Trust(dir).get(b.id.addr)!.grants, undefined);
+    assert.equal(new Trust(new FileStorage(dir)).get(b.id.addr)!.grants, undefined);
   } finally {
     close(a, b);
   }
@@ -49,9 +50,9 @@ test("grants persist", async () => {
     await pair(a, b);
     const want: Grant[] = [{ tool: "com.a.x", level: LevelRead }];
     a.setGrants(b.id.addr, want);
-    assert.deepEqual(allowed(new Trust(dir).get(b.id.addr)!), want);
+    assert.deepEqual(allowed(new Trust(new FileStorage(dir)).get(b.id.addr)!), want);
     a.revokeGrants(b.id.addr);
-    const p = new Trust(dir).get(b.id.addr)!;
+    const p = new Trust(new FileStorage(dir)).get(b.id.addr)!;
     assert.ok(p.grants && allowed(p).length === 0, "revoked grants come back as the default");
     assert.throws(() => a.setGrants("nobody", want), "grants for a stranger");
   } finally {

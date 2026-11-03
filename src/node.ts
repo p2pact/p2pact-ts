@@ -1,16 +1,19 @@
 // Node is a device in a P2PACT network (spec §1–§8): pairing, sessions over any road,
-// delivery, messages and compression. Single-threaded: everything runs on the event loop.
+// delivery, messages and compression. Single-threaded: everything runs on the event loop. This
+// file is for Node.js and browsers alike: roads, storage and the zstd codec come from outside
+// (node-fs.ts is the Node.js flavour, browser.ts the browser's).
+import { AttachedRoad, MaxRoadPacket as MaxRoadPacketSize, type AppRoad, type AppRoadConfig } from "./approad.js";
 import { decode, decodeArrayRaw, encode, type CborValue } from "./cbor.js";
-import { compress, decompress, Dict, DictStore, dictId, has } from "./compress.js";
+import { Dict, DictStore, dictId, frameCompress, frameDecompress, has, type Codec } from "./compress.js";
 import { address, equal, hex, randomBytes } from "./crypto.js";
 import { dataHeader, keepalive, msgMax, Stream, type StreamId } from "./delivery.js";
-import { Learner, learnTiming } from "./learn.js";
 import { cleanGrants, defaultGrants, grantLevel, grantsWire, LevelRead, LevelWrite, parseGrants, type Grant } from "./grants.js";
 import { FirstNamedTool, fixedTools, validToolName, type ToolRef } from "./tools.js";
 import { CipherState, concat, Handshake } from "./noise.js";
-import { LocalRoad } from "./local.js";
-import { endpointKey, TCPRoad, UDPRoad, type Endpoint, type Road } from "./roads.js";
-import { allowed, hintsFromWire, hintsToWire, Identity, Invite, offered, Prologue, Trust, type Hints, type Peer } from "./store.js";
+import { endpointKey, type AddrRoad, type Endpoint, type Road } from "./roads.js";
+import { WsRelayRoad, type WebSocketCtor } from "./relay-ws.js";
+import type { Storage } from "./storage.js";
+import { allowed, hintsFromWire, hintsToWire, Identity, Invite, offered, Prologue, relayChannel, Trust, type Hints, type Peer } from "./store.js";
 
 const pInit = 1, pResp = 2, pPair1 = 3, pPair2 = 4, pPair3 = 5, pData = 6, pReset = 7;
 const tsSkew = 120_000n * 1_000_000n; // ns
@@ -179,7 +182,31 @@ const be32 = (v: number) => {
   new DataView(b.buffer).setUint32(0, v >>> 0);
   return b;
 };
-const goos = (): string => ({ win32: "windows" } as Record<string, string>)[process.platform] ?? process.platform;
+const goos = (): string => {
+  const p = (globalThis as { process?: { platform?: string } }).process?.platform;
+  return p ? ({ win32: "windows" } as Record<string, string>)[p] ?? p : "browser";
+};
+
+/** DictLearner trains our own dictionaries (spec §5): Node.js has one (learn.ts); a browser
+ * trains none. */
+export interface DictLearner {
+  talk(peer: string, msg: Uint8Array, d: Dict | null, z: Uint8Array | null): void;
+  hear(peer: string, msg: Uint8Array): void;
+  tick(): void;
+  close(): void;
+  forget(peer: string): void;
+  training(peer: string): boolean;
+}
+
+export interface NodeOptions {
+  /** zstd: Node.js uses node:zlib (compress-node.ts), a browser a wasm decoder (codec-wasm.ts).
+   * Without one, nothing is compressed or decompressed: a peer that compresses for us is held. */
+  codec?: Codec;
+  /** makes the learner of our own dictionaries; onDict gets the dictionaries it trained */
+  learner?: (dicts: DictStore, onDict: (d: Dict) => void) => DictLearner;
+  /** WebSocket constructor for the relay (default: the global one) */
+  WebSocket?: WebSocketCtor;
+}
 
 export class Node {
   readonly id: Identity;
@@ -211,10 +238,15 @@ export class Node {
   kind = KindUnknown;
 
   private boot = u32(randomBytes(4), 0) || 1;
-  private udp?: UDPRoad;
-  private tcp?: TCPRoad;
-  private loc?: LocalRoad; // the local socket road (local.ts)
+  private udp?: AddrRoad;
+  private tcp?: AddrRoad;
+  private loc?: Road; // the local socket road (local.ts)
   private localPath_ = ""; // the socket we listen on, or dial
+  private apps = new Set<AttachedRoad>(); // application roads (attachRoad)
+  private relays = new Map<string, WsRelayRoad>(); // by WebSocket URL
+  private ownWs: string[] = []; // our relay's WebSocket URLs (setRelay)
+  private codec?: Codec;
+  private wsCtor?: WebSocketCtor;
   // invites made for programs (pluginInvite) and the grants their install gave
   private inviteGrants = new Map<string, Grant[]>();
   private sessions = new Map<number, Session>();
@@ -233,50 +265,43 @@ export class Node {
   private versions = new Map<number, number>();
   private resetAt = new Map<string, number>();
   private dicts: DictStore;
-  private learner: Learner;
-  private timers: NodeJS.Timeout[] = [];
+  private learner?: DictLearner;
+  private timers: ReturnType<typeof setInterval>[] = [];
   private woken = false;
   private closed = false;
   private hintsSent: Uint8Array | null = null; // our addresses as last announced (reannounce)
   private hintsAt = 0; // when last checked
   handshakes = 0;
 
-  constructor(dir: string, readonly name: string) {
-    this.id = Identity.load(dir);
-    this.trust = new Trust(dir);
-    this.dicts = new DictStore(dir);
-    this.learner = new Learner(dir, this.dicts, (d) => this.addDictLocal(d));
+  /** storage keeps the keys, the known devices and the dictionaries (FileStorage, IdbStorage). */
+  constructor(storage: Storage, readonly name: string, opts: NodeOptions = {}) {
+    this.id = Identity.load(storage);
+    this.trust = new Trust(storage);
+    this.dicts = new DictStore(storage);
+    this.codec = opts.codec;
+    this.wsCtor = opts.WebSocket;
+    this.learner = opts.learner?.(this.dicts, (d) => this.addDictLocal(d));
     this.handle(0, 1, () => []);
     this.handle(0, 2, (peer) => this.info(peer));
     this.handle(0, 5, (peer, args) => this.dictHandler(peer, args));
     this.handle(0, 6, (peer) => [grantsWire(this.grants(peer))]); // what the caller may use
   }
 
-  async listenUDP(addr: string) {
-    this.udp = await UDPRoad.listen(addr, (p, f) => this.receive(p, f));
+  /** setUDP gives the node its UDP road (UDPRoad.listen); its address goes into the hints. The
+   * road's receive callback is {@link receive}. */
+  setUDP(road: AddrRoad) {
+    this.udp = road;
   }
 
-  /** listenTCP opens the fallback road; "" — dial only. */
-  async listenTCP(addr: string) {
-    this.tcp = await TCPRoad.listen(addr, (p, f) => this.receive(p, f));
+  /** setTCP gives the node the fallback road (TCPRoad.listen). */
+  setTCP(road: AddrRoad) {
+    this.tcp = road;
   }
 
-  /** listenLocal opens the local socket at path (spec §3): a Unix domain socket readable and
-   * writable by our OS user only (mode 0600), on Windows a named pipe. An old socket file nobody
-   * listens on is replaced. */
-  async listenLocal(path: string) {
-    if (!path) throw new Error("no socket path");
+  /** setLocal gives the node the local socket road (spec §3) at path: we listen on it, or dial it. */
+  setLocal(road: Road, path: string) {
     if (this.loc) throw new Error("the local socket is already in use");
-    this.loc = await LocalRoad.open(path, (p, f) => this.receive(p, f));
-    this.localPath_ = path;
-  }
-
-  /** useLocal makes the node reach a device on this computer over its local socket at path: join
-   * and the session use it. The node does not listen. */
-  async useLocal(path: string) {
-    if (!path) throw new Error("no socket path");
-    if (this.loc) throw new Error("the local socket is already in use");
-    this.loc = await LocalRoad.open("", (p, f) => this.receive(p, f));
+    this.loc = road;
     this.localPath_ = path;
   }
 
@@ -297,18 +322,22 @@ export class Node {
     return this.tcp;
   }
 
-  start() {
-    this.timers.push(setInterval(() => this.pump(), 20), setInterval(() => this.maintain(), 1000),
-      setInterval(() => this.learner.tick(), learnTiming.tick));
+  /** tickMs: how often the learner takes its queues (learn.ts learnTiming.tick) */
+  start(tickMs = 1000) {
+    this.timers.push(setInterval(() => this.pump(), 20), setInterval(() => this.maintain(), 1000));
+    if (this.learner) this.timers.push(setInterval(() => this.learner!.tick(), tickMs));
+    for (const p of this.trust.list()) this.joinPairRelay(p);
   }
 
   close() {
     this.closed = true;
     for (const t of this.timers) clearInterval(t);
-    this.learner.close();
+    this.learner?.close();
     this.udp?.close();
     this.tcp?.close();
     this.loc?.close();
+    for (const r of this.relays.values()) r.close();
+    for (const a of [...this.apps]) a.detach();
     for (const ps of this.peers.values()) for (const c of ps.calls.values()) c.reject(new Error("node closed"));
   }
 
@@ -525,6 +554,7 @@ export class Node {
   invite(ttlMs: number): Invite {
     const inv = new Invite(this.id.key.public, this.name, randomBytes(32), new Date(Date.now() + ttlMs), this.hints());
     this.invites.set(hex(inv.id), inv);
+    if (this.ownWs.length) this.relayFor(this.ownWs[0]).join(hex(inv.id), "a");
     return inv;
   }
 
@@ -542,7 +572,17 @@ export class Node {
     if (this.udp) for (const a of inv.hints.udp ?? []) eps.push({ road: this.udp, addr: a });
     if (this.tcp) for (const a of inv.hints.tcp ?? []) eps.push({ road: this.tcp, addr: a });
     if (this.loc && this.localPath_) eps.push({ road: this.loc, addr: this.localPath_ }); // a device on this computer, over its socket
+    const inviter = address(inv.key);
+    for (const a of this.apps) if (a.peer === "" || a.peer === inviter) eps.push({ road: a, addr: a.id }); // a link the application opened
+    const wsUrl = inv.hints.ws?.[0];
+    let invRelay: WsRelayRoad | undefined;
+    if (wsUrl && (this.wsCtor || (globalThis as { WebSocket?: unknown }).WebSocket)) { // the inviter's relay: its channel is the invite's
+      invRelay = this.relayFor(wsUrl);
+      invRelay.join(hex(inv.id), "b");
+      eps.push({ road: invRelay, addr: hex(inv.id) });
+    }
     if (eps.length === 0) throw new Error("the invite has no road we can use");
+    const leaveInvite = () => invRelay?.leave(hex(inv.id));
     const deadline = Date.now() + timeoutMs;
     let local = 0;
     for (;;) {
@@ -557,12 +597,14 @@ export class Node {
       for (const e of eps) e.road.send(e.addr, pkt);
       const r = await Promise.race([done.then(() => "ok"), new Promise((r) => setTimeout(() => r("again"), initEvery))]);
       if (r === "ok") {
+        leaveInvite();
         const p = this.trust.get(address(inv.key));
         if (!p) throw new Error("pairing was not saved");
         return p;
       }
       if (Date.now() > deadline) {
         this.hs.delete(local);
+        leaveInvite();
         throw new Error("pairing timed out");
       }
     }
@@ -587,12 +629,15 @@ export class Node {
       return;
     }
     this.trust.put({ ...p, pairSecret: this.id.shared(p.key, "family-pair") });
+    this.joinPairRelay(this.trust.get(p.addr)!);
   }
 
   /** forget drops a known device; our conversation's dictionaries and history go too. */
   forget(addr: string) {
     this.dicts.forget(addr);
-    this.learner.forget(addr);
+    this.learner?.forget(addr);
+    const gone = this.trust.get(addr);
+    if (gone) this.pairRelay(gone)?.leave(relayChannel(gone));
     for (const c of this.peers.get(addr)?.calls.values() ?? []) c.reject(new Error("device forgotten"));
     this.peers.delete(addr);
     const s = this.current.get(addr);
@@ -671,12 +716,14 @@ export class Node {
     if (udp?.length) h.udp = udp;
     const tcp = this.tcp?.localAddrs();
     if (tcp?.length) h.tcp = tcp;
+    if (this.ownWs.length) h.ws = [...this.ownWs];
     return h;
   }
 
   // --- receiving ---
 
-  private receive(pkt: Uint8Array, from: Endpoint) {
+  /** receive is what a road hands the node: a packet and the endpoint it came from. */
+  receive(pkt: Uint8Array, from: Endpoint) {
     if (pkt.length < 5) return;
     const now = Date.now();
     try {
@@ -827,10 +874,12 @@ export class Node {
     hints.udp ??= inv.hints.udp;
     hints.tcp ??= inv.hints.tcp;
     hints.relay ??= inv.hints.relay;
+    hints.ws ??= inv.hints.ws;
     const p: Peer = { addr: peer, key: inv.key, name: pp.name, pairSecret: inv.secret, hints, added: 0,
       signKey: pp.signKey, os: pp.os, kind: pp.kind || undefined, local: this.isLocal(from) || undefined,
       granted: h.wants ? [] : undefined }; // asked: nothing until the first 0.6 (spec §2)
     this.trust.put(p);
+    this.joinPairRelay(p);
     const s: Session = { peer, local, remote: u32(pkt, 5), send: c1, recv: c2, sendN: 0, win: new Window(), lastRecv: now };
     this.sessions.set(local, s);
     this.current.set(peer, s);
@@ -875,6 +924,8 @@ export class Node {
     }
     if (pp.kind === KindPlugin) p.hints = {}; // reachable over the local socket only
     this.trust.put(p);
+    if (this.ownWs.length) this.relayFor(this.ownWs[0]).leave(hex(inv.id)); // the invite is single use
+    this.joinPairRelay(p);
     const s: Session = { peer, local, remote: h.remoteIdx!, send: c2, recv: c1, sendN: 0, win: new Window(), lastRecv: now };
     this.sessions.set(local, s);
     this.current.set(peer, s);
@@ -993,6 +1044,8 @@ export class Node {
       const ev = decode(a[2]) as number;
       if (tool === 0 && ev === 2 && a.length >= 9) {
         this.trust.setHints(peer, String(decode(a[3]) ?? ""), String(decode(a[4]) ?? ""), hintsFromWire(decode(a[8])));
+        const known = this.trust.get(peer);
+        if (known) this.joinPairRelay(known);
         if (a.length >= 10) {
           const kind = decode(a[9]);
           if (typeof kind === "number") this.trust.setKind(peer, kind);
@@ -1087,7 +1140,7 @@ export class Node {
       if (mine.length) alive = mine;
     }
     if (alive.length > 0 && !all) {
-      const rank = (e: EpState) => ({ udp: 0, tcp: 1, local: 1 } as Record<string, number>)[e.ep.road.name] ?? 2;
+      const rank = (e: EpState) => e.ep.road.rank ?? 2;
       // the road heard from last; a better kind only if heard within half a second of it
       let best = alive.reduce((b, e) => (e.lastRecv > b.lastRecv ? e : b));
       for (const e of alive) if (rank(e) < rank(best) && best.lastRecv - e.lastRecv < 500) best = e;
@@ -1110,6 +1163,9 @@ export class Node {
     if (p.kind === KindPlugin) return out; // reachable over the local socket only, on the connection it opened
     add(this.udp, p.hints.udp);
     add(this.tcp, p.hints.tcp);
+    const relay = this.pairRelay(p);
+    if (relay) add(relay, [relayChannel(p)]);
+    for (const a of this.apps) if (a.peer === p.addr) add(a, [a.id]); // a link the application opened to this device
     return out;
   }
 
@@ -1146,7 +1202,7 @@ export class Node {
   private wake() {
     if (this.woken || this.closed) return;
     this.woken = true;
-    setImmediate(() => {
+    (typeof setImmediate === "function" ? setImmediate : (f: () => void) => setTimeout(f, 0))(() => {
       this.woken = false;
       if (!this.closed) this.pump();
     });
@@ -1168,7 +1224,7 @@ export class Node {
         continue;
       }
       const c = this.candidates(peer, ps, now, false);
-      if (c.length === 1) ps.st.reliable = c[0].ep.road.name !== "udp";
+      if (c.length === 1) ps.st.reliable = c[0].ep.road.reliable ?? c[0].ep.road.name !== "udp";
       for (let i = 0; ; i++) {
         if (i === 256) {
           this.wake();
@@ -1259,8 +1315,8 @@ export class Node {
       return;
     }
     const [d, slot] = this.dicts.pick(ps.addr, ps.dicts, ps.lacks);
-    const z = compress(msg, d, slot);
-    if (talk && !this.noLearning) this.learner.talk(ps.addr, msg, d, z);
+    const z = this.codec ? frameCompress(this.codec, msg, d, slot) : null;
+    if (talk && !this.noLearning) this.learner?.talk(ps.addr, msg, d, z);
     if (z) ps.st.push(z, true, stream, reply);
     else ps.st.push(msg, false, stream, reply);
     this.wake();
@@ -1268,7 +1324,7 @@ export class Node {
 
   /** hear queues a conversation message we got from the device for the history. */
   private hear(peer: string, msg: Uint8Array) {
-    if (!this.noCompression && !this.noLearning) this.learner.hear(peer, msg);
+    if (!this.noCompression && !this.noLearning) this.learner?.hear(peer, msg);
   }
 
   /** inbound decompresses a reassembled message and runs it in order. A missing dictionary is
@@ -1327,7 +1383,7 @@ export class Node {
     if (msg.length < 2 || msg[0] === 0) return null;
     for (const d of this.dicts.list(ps.addr)) {
       try {
-        const plain = decompress(msg, d, msgMax);
+        const plain = this.unzipWith(msg, d);
         if (!bootstrap(plain)) continue;
         decodeArrayRaw(plain);
         return plain;
@@ -1374,10 +1430,15 @@ export class Node {
       if (!d) return { missing: true };
     }
     try {
-      return { plain: decompress(msg, d, msgMax) };
+      return { plain: this.unzipWith(msg, d) };
     } catch {
       return {};
     }
+  }
+
+  private unzipWith(msg: Uint8Array, d: Dict | null): Uint8Array {
+    if (!this.codec) throw new Error("no zstd codec");
+    return frameDecompress(this.codec, msg, d, msgMax);
   }
 
   /** fetchNew asks the device for the newest dictionary in its list that we lack: so it can
@@ -1467,12 +1528,68 @@ export class Node {
     const own = this.dicts.own(peer)?.id ?? null;
     const ps = this.peers.get(peer);
     const using = ps ? this.dicts.pick(peer, ps.dicts, ps.lacks)[0]?.id ?? null : null;
-    return { own, using, training: this.learner.training(peer) };
+    return { own, using, training: this.learner?.training(peer) ?? false };
   }
 
-  /** learning exposes the learner to tests. */
-  get learning(): Learner {
+  /** learning exposes the learner (Node.js) to tests. */
+  get learning(): DictLearner | undefined {
     return this.learner;
+  }
+
+  // --- roads from outside: the relay, application roads ---
+
+  /** setRelay gives the node a relay it listens on over WebSocket (spec §3): its URLs go into
+   * the hints (the `ws` element), invites and paired devices meet through it. For a browser
+   * node that is the whole network. Call before invite() and start(). */
+  setRelay(urls: string | string[]) {
+    this.ownWs = Array.isArray(urls) ? [...urls] : [urls];
+    for (const p of this.trust.list()) this.joinPairRelay(p);
+  }
+
+  private relayFor(url: string): WsRelayRoad {
+    let r = this.relays.get(url);
+    if (!r) {
+      r = new WsRelayRoad(url, (p, f) => this.receive(p, f), this.wsCtor);
+      this.relays.set(url, r);
+    }
+    return r;
+  }
+
+  /** pairRelay picks the pair's relay as the Go node does (spec §7): the one of the device with
+   * the lower address, else the other's; only WebSocket relays, the one thing we dial. */
+  private pairRelay(p: Peer): WsRelayRoad | undefined {
+    if (!this.wsCtor && !(globalThis as { WebSocket?: unknown }).WebSocket) return undefined;
+    const mine = this.ownWs[0], theirs = p.hints.ws?.[0];
+    const url = p.addr < this.id.addr ? theirs ?? mine : mine ?? theirs;
+    return url ? this.relayFor(url) : undefined;
+  }
+
+  private joinPairRelay(p: Peer) {
+    if (p.kind === KindPlugin) return;
+    this.pairRelay(p)?.join(relayChannel(p), p.addr < this.id.addr ? "b" : "a");
+  }
+
+  /** attachRoad attaches a road the application provides (spec §3): a WebRTC data channel,
+   * Bluetooth LE… peer is the device it reaches, if known: the node sends to it on this road as
+   * on its hints and starts a session over it at once if it has none. With peer "" the road is
+   * bound by what arrives on it (a handshake or session packet names the device) and is offered
+   * for pairing (join). Give what arrives to AttachedRoad.receive. */
+  attachRoad(peer: string, road: AppRoad, cfg: AppRoadConfig): AttachedRoad {
+    if (!road || !(cfg.mtu >= 1)) throw new Error("an application road needs send and an MTU");
+    if (!cfg.stream && cfg.mtu < MaxRoadPacketSize) {
+      throw new Error(`a datagram road must carry ${MaxRoadPacketSize} bytes; a smaller link that keeps order is a stream road`);
+    }
+    if (peer && !this.trust.get(peer)) throw new Error("unknown device");
+    const a = new AttachedRoad((p, f) => this.receive(p, f), (x) => this.detached(x), road, cfg, peer);
+    this.apps.add(a);
+    const ps = peer ? this.peerState(peer) : undefined;
+    if (ps && !this.current.has(peer)) this.startInit(Date.now(), peer, ps, null);
+    return a;
+  }
+
+  private detached(a: AttachedRoad) {
+    this.apps.delete(a);
+    for (const ps of this.peers.values()) for (const [k, e] of ps.eps) if (e.ep.road === a) ps.eps.delete(k);
   }
 }
 

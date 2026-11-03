@@ -175,7 +175,7 @@ export class Learner {
     if (d) {
       h.trained = h.size();
       try {
-        h.at = fs.statSync(path.join(this.dicts.dir, hex(d.id))).mtimeMs;
+        h.at = fs.statSync(path.join(this.dir, "net-dicts", hex(d.id))).mtimeMs;
       } catch {
         /* unknown: the monthly check retrains */
       }

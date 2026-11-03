@@ -1,11 +1,13 @@
 import { test } from "node:test";
+import { FileStorage } from "../src/storage-node.js";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { commonDict, decode, encode, ErrFailed, Invite, Node, P2PACTError } from "../src/index.js";
 import { bootstrap, holdTiming } from "../src/node.js";
-import { compress, decompress, Dict, DictStore } from "../src/compress.js";
+import { Dict, DictStore } from "../src/compress.js";
+import { compress, decompress } from "../src/compress-node.js";
 import { buildDict, entropyEnd, trainDict } from "../src/cover.js";
 import { historyPath, learnTiming } from "../src/learn.js";
 import { equal, hex } from "../src/crypto.js";
@@ -81,7 +83,7 @@ test("the common dictionary ships with the package", () => {
 // A dictionary keeps its slot while listed: a message compressed with it may arrive after the
 // new list, on another stream. A dropped one leaves a free slot; new ones go to the end.
 test("dictionary slots stay", () => {
-  const s = new DictStore(tmp());
+  const s = new DictStore(new FileStorage(tmp()));
   const ds = Array.from({ length: 6 }, (_, i) => new Dict(testDict(i), "b", true));
   s.add(ds[0]);
   s.add(ds[1]);
@@ -99,7 +101,7 @@ test("dictionary slots stay", () => {
 
 // Past 32 slots a new dictionary takes the oldest empty slot instead of growing the list.
 test("slots are reused only past 32", () => {
-  const s = new DictStore(tmp());
+  const s = new DictStore(new FileStorage(tmp()));
   const common = Array.from({ length: 40 }, (_, i) => new Dict(testDict(100 + i)));
   for (let i = 0; i < 32; i++) {
     s.add(common[i]);
@@ -117,13 +119,13 @@ test("slots are reused only past 32", () => {
 // A damaged line in the order file never makes a pair's dictionary a common one.
 test("a damaged order line keeps a pair's dictionary private", () => {
   const dir = tmp();
-  const s = new DictStore(dir);
+  const s = new DictStore(new FileStorage(dir));
   const d = new Dict(testDict(0), "b", true);
   s.add(d);
-  assert.equal(new DictStore(dir).ids("b").length, 1, "the pair's dictionary survives a restart");
-  assert.equal(new DictStore(dir).own("b")?.own, true);
+  assert.equal(new DictStore(new FileStorage(dir)).ids("b").length, 1, "the pair's dictionary survives a restart");
+  assert.equal(new DictStore(new FileStorage(dir)).own("b")?.own, true);
   fs.writeFileSync(path.join(dir, "net-dicts", "order"), hex(d.id) + " b\n");
-  assert.equal(new DictStore(dir).ids("c").length, 0, "a damaged line made b's dictionary visible to c");
+  assert.equal(new DictStore(new FileStorage(dir)).ids("c").length, 0, "a damaged line made b's dictionary visible to c");
 });
 
 // With the common dictionary on both sides, messages go compressed with it.
@@ -171,7 +173,7 @@ test("own dictionary per device", async () => {
     await waitFor("the history was not written", () => a.learning.flushed(b.id.addr));
     const before = a.learning.historySize(b.id.addr);
     const dir = dirs.get(a)!;
-    const again = new DictStore(dir);
+    const again = new DictStore(new FileStorage(dir));
     assert.ok(again.own(b.id.addr) && equal(again.own(b.id.addr)!.id, own), "the own dictionary was not saved");
     const n2 = new Node(dir, "Mac");
     const after = n2.learning.historySize(b.id.addr);

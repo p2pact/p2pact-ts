@@ -23,7 +23,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { createInterface } from "node:readline";
 import { decode } from "./cbor.js";
-import { ErrFailed, later, Node, P2PACTError } from "./node.js";
+import { ErrFailed, later, P2PACTError } from "./node.js";
+import { Node } from "./node-fs.js";
 import type { Grant } from "./grants.js";
 import { Invite } from "./store.js";
 

@@ -1,6 +1,6 @@
 // Helpers: events, reading JSON trees, CBOR <-> JSON.
-import { Buffer } from "node:buffer";
 import type { CborValue } from "../cbor.js";
+import { toBase64 } from "../bytes.js";
 import { blake2s } from "../crypto.js";
 import type { StreamId } from "../delivery.js";
 import { NotDeliveredError } from "./errors.js";
@@ -95,7 +95,7 @@ export const p2pactMeta = (m: JsonMap): JsonMap => obj(obj(m, "_meta") ?? {}, "p
 export function normalize(v: CborValue): unknown {
   if (v instanceof Map) return Object.fromEntries([...v].map(([k, x]) => [String(k), normalize(x)]));
   if (Array.isArray(v)) return v.map(normalize);
-  if (v instanceof Uint8Array) return Buffer.from(v).toString("base64");
+  if (v instanceof Uint8Array) return toBase64(v);
   if (typeof v === "bigint") return Number(v);
   if (v === undefined) return null;
   if (v !== null && typeof v === "object") return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, normalize(x)]));
@@ -115,9 +115,14 @@ export function wire(v: unknown): CborValue {
 /** streamOf is the stream of a session or resource: the first 8 bytes of BLAKE2s(id) as an
  * unsigned number, 0 replaced by 1 (chat spec §2); no id — 0. A number while it is safe, else a
  * bigint (see StreamId). */
+function hash64(id: string): bigint {
+  const h = blake2s(new TextEncoder().encode(id));
+  return new DataView(h.buffer, h.byteOffset, h.byteLength).getBigUint64(0);
+}
+
 export function streamOf(id: string | undefined): StreamId {
   if (!id) return 0;
-  const n = Buffer.from(blake2s(new TextEncoder().encode(id)).subarray(0, 8)).readBigUInt64BE(0) || 1n;
+  const n = hash64(id) || 1n;
   return n <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(n) : n;
 }
 
@@ -132,7 +137,7 @@ export function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise
 
 /** afterEvents resolves once the events the node has already queued (each handled synchronously)
  * have run: a call's result may come ahead of the events sent before it on the same stream. */
-export const afterEvents = (): Promise<void> => new Promise((r) => setImmediate(r));
+export const afterEvents = (): Promise<void> => new Promise((r) => (typeof setImmediate === "function" ? setImmediate(r) : setTimeout(r, 0)));
 
 /** deferred is a promise with its resolve and reject at hand. */
 export function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void; reject: (e: unknown) => void } {

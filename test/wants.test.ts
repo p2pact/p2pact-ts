@@ -1,4 +1,5 @@
 import { test } from "node:test";
+import { FileStorage } from "../src/storage-node.js";
 import assert from "node:assert/strict";
 import { Invite, Node, Trust, AllTools, allowed, defaultGrants, ErrForbidden, KindClient, LevelRead, LevelWrite, type Grant, type Peer } from "../src/index.js";
 import { close, code, echo, eventually, node, pair, tmp } from "./util.js";
@@ -97,7 +98,7 @@ test("wants: nothing until the first 0.6", async () => {
     };
     await pair(a, b, [{ tool: "com.acme.x", level: LevelWrite }]);
     assert.deepEqual(b.grantedBy(a.id.addr), []);
-    assert.deepEqual(new Trust(dir).get(a.id.addr)!.granted, [], "kept over a restart");
+    assert.deepEqual(new Trust(new FileStorage(dir)).get(a.id.addr)!.granted, [], "kept over a restart");
     release();
     await eventually("told", () => JSON.stringify(b.grantedBy(a.id.addr)) === JSON.stringify([{ tool: "com.acme.x", level: LevelRead }]));
     a.onWants = undefined;

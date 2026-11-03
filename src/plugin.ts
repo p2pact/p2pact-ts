@@ -1,6 +1,7 @@
 // Plugin side (spec §2, §8.2): a program a device starts, which pairs over the device's local
 // socket with kind plugin and adds tools to it.
-import { KindPlugin, Node } from "./node.js";
+import { KindPlugin } from "./node.js";
+import { Node } from "./node-fs.js";
 import { Invite, type Peer } from "./store.js";
 
 /** Environment variables a device gives a program it starts (spec §2, local programs). */

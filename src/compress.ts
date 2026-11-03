@@ -1,24 +1,16 @@
 // Compression (spec §5): zstd with a dictionary. A compressed message is [dictionary slot 1]
 // [zstd frame without its magic and dictionary id]: the receiver knows both from the slot in
 // the sender's dictionary list. Slot 0 means no dictionary.
-import * as fs from "node:fs";
-import * as path from "node:path";
-import * as zlib from "node:zlib";
 import { blake2s, equal, hex } from "./crypto.js";
+import { readText, writeText, type Storage } from "./storage.js";
 
 export const zipMin = 64;
-// zipFastFrom: from this size on, a faster level — the best one costs more time than the few
-// percent of bytes it saves; zipQuickBelow: shorter messages with a dictionary at the fastest
-// level (most chat messages; loading a 64 KB dictionary for the best one costs milliseconds).
-const zipFastFrom = 32 << 10;
-const zipQuickBelow = 1 << 10;
 const MAGIC = Uint8Array.of(0x28, 0xb5, 0x2f, 0xfd);
 const DICT_MAGIC = 0xec30a437;
 
 export class Dict {
   readonly id: Uint8Array;
   readonly zid: number; // dictionary id inside zstd (0 for a raw-content dictionary)
-  private buf?: Buffer;
 
   /** peer: "" — a common dictionary, anyone may have it; otherwise it belongs to the pair with
    * this device and is never shown or given to another. own: we trained it (for peer). */
@@ -32,10 +24,17 @@ export class Dict {
   visible(peer: string): boolean {
     return this.peer === "" || this.peer === peer;
   }
+}
 
-  get buffer(): Buffer {
-    return (this.buf ??= Buffer.from(this.raw));
-  }
+/** Codec is a zstd implementation (spec §5): Node.js has one in node:zlib (compress-node.ts); a
+ * browser decodes in wasm and never compresses (codec-wasm.ts). Frames are whole zstd frames,
+ * with their magic and dictionary id. */
+export interface Codec {
+  /** compress returns the frame of msg (made with dictionary d, null — none), or null: this
+   * codec does not compress, or it is not worth it. */
+  compress(msg: Uint8Array, d: Dict | null): Uint8Array | null;
+  /** decompress reverses compress; it throws on a damaged frame or output beyond max. */
+  decompress(frame: Uint8Array, d: Dict | null, max: number): Uint8Array;
 }
 
 /** dictId is a dictionary's id: the first 16 bytes of BLAKE2s of its bytes. */
@@ -43,22 +42,14 @@ export function dictId(raw: Uint8Array): Uint8Array {
   return blake2s(raw).subarray(0, 16);
 }
 
-function zopts(d: Dict | null, size: number): zlib.ZstdOptions {
-  const c = zlib.constants as unknown as Record<string, number>;
-  let level = d ? 7 : 19;
-  if (size >= zipFastFrom) level = 3;
-  else if (d && size < zipQuickBelow) level = 1;
-  const o: zlib.ZstdOptions = { params: { [c.ZSTD_c_compressionLevel]: level, [c.ZSTD_c_checksumFlag]: 0 } };
-  if (d) (o as { dictionary?: Buffer }).dictionary = d.buffer;
-  return o;
-}
-
-/** compress returns [slot | frame] for a receiver that has d (null — none), or null when not worth it. */
-export function compress(msg: Uint8Array, d: Dict | null, slot: number): Uint8Array | null {
+/** frameCompress returns [slot | frame] for a receiver that has d (null — none), or null when
+ * not worth it (the frame has its magic and dictionary id stripped, §5). */
+export function frameCompress(codec: Codec, msg: Uint8Array, d: Dict | null, slot: number): Uint8Array | null {
   if (msg.length < zipMin) return null;
   let frame: Uint8Array | null;
   try {
-    frame = stripFrame(new Uint8Array(zlib.zstdCompressSync(msg, zopts(d, msg.length))));
+    const f = codec.compress(msg, d);
+    frame = f && stripFrame(f);
   } catch {
     return null;
   }
@@ -69,15 +60,12 @@ export function compress(msg: Uint8Array, d: Dict | null, slot: number): Uint8Ar
   return out;
 }
 
-/** decompress reverses compress; d is the dictionary for the slot in the first byte. */
-export function decompress(b: Uint8Array, d: Dict | null, max: number): Uint8Array {
+/** frameDecompress reverses frameCompress; d is the dictionary for the slot in the first byte. */
+export function frameDecompress(codec: Codec, b: Uint8Array, d: Dict | null, max: number): Uint8Array {
   if (b.length < 2) throw new Error("short");
   const frame = restoreFrame(b.subarray(1), d ? d.zid : 0);
   if (!frame) throw new Error("bad frame");
-  const o: zlib.ZstdOptions = { maxOutputLength: max };
-  if (d) (o as { dictionary?: Buffer }).dictionary = d.buffer;
-  const out = zlib.zstdDecompressSync(frame, o);
-  return new Uint8Array(out);
+  return codec.decompress(frame, d, max);
 }
 
 /** stripFrame drops the zstd magic (4 bytes) and the dictionary id (up to 4) from a frame. */
@@ -130,7 +118,6 @@ const slotsMax = 32;
  * for a pair's. */
 export class DictStore {
   dicts: Dict[] = []; // newest first
-  readonly dir: string;
   // slots: what we list to each device, by slot. A dictionary keeps its slot while listed (a
   // message compressed with it may still be on its way on another stream, behind the new list);
   // a dropped one leaves an empty id, and a new one goes to the end.
@@ -138,24 +125,16 @@ export class DictStore {
   private gen = 0; // bumped on every change of the dictionaries
   private cache = new Map<string, { gen: number; ids: Uint8Array[] }>();
 
-  constructor(dir: string) {
-    this.dir = path.join(dir, "net-dicts");
-    let order = "";
-    try {
-      order = fs.readFileSync(path.join(this.dir, "order"), "utf8");
-    } catch {
-      return;
-    }
+  constructor(private st: Storage) {
+    const order = readText(st, "net-dicts/order");
+    if (order === undefined) return;
     for (const line of order.split("\n")) {
       const f = line.split(/\s+/).filter(Boolean);
       if (f.length !== 1 && f.length !== 3) continue; // a damaged line: never take a pair's dictionary for a common one
-      try {
-        const raw = new Uint8Array(fs.readFileSync(path.join(this.dir, f[0])));
-        const d = f.length === 3 ? new Dict(raw, f[1], f[2] === "own") : new Dict(raw);
-        if (hex(d.id) === f[0]) this.dicts.push(d);
-      } catch {
-        /* missing file: skip */
-      }
+      const raw = st.read("net-dicts/" + f[0]);
+      if (!raw) continue; // missing file: skip
+      const d = f.length === 3 ? new Dict(raw, f[1], f[2] === "own") : new Dict(raw);
+      if (hex(d.id) === f[0]) this.dicts.push(d);
     }
   }
 
@@ -166,8 +145,7 @@ export class DictStore {
 
   /** add puts a dictionary first (moving it up if known) and deletes the oldest extra ones of its kind. */
   add(d: Dict) {
-    fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(path.join(this.dir, hex(d.id)), d.raw, { mode: 0o600 });
+    this.st.write("net-dicts/" + hex(d.id), d.raw);
     const out = [d], dropped: Dict[] = [];
     const kinds = new Map<string, number>([[`${d.peer} ${d.own}`, 1]]);
     for (const x of this.dicts) {
@@ -179,7 +157,7 @@ export class DictStore {
       else out.push(x);
     }
     for (const x of dropped) { // one file serves the same bytes kept as another kind
-      if (!listed(out, x.id)) fs.rmSync(path.join(this.dir, hex(x.id)), { force: true });
+      if (!listed(out, x.id)) this.st.remove("net-dicts/" + hex(x.id));
     }
     this.dicts = out;
     this.gen++;
@@ -190,9 +168,7 @@ export class DictStore {
    * dictionary into a common one (though loading skips damaged lines too). */
   private saveOrder() {
     const lines = this.dicts.map((x) => hex(x.id) + (x.peer ? ` ${x.peer} ${x.own ? "own" : "their"}` : ""));
-    const file = path.join(this.dir, "order");
-    fs.writeFileSync(file + ".tmp", lines.join("\n") + "\n", { mode: 0o600 });
-    fs.renameSync(file + ".tmp", file);
+    writeText(this.st, "net-dicts/order", lines.join("\n") + "\n");
   }
 
   /** list is what peer sees of our dictionaries, newest first: the common ones and the pair's. */
@@ -252,7 +228,7 @@ export class DictStore {
     const drop = this.dicts.filter((d) => d.peer === peer);
     if (drop.length === 0) return;
     this.dicts = keep;
-    for (const d of drop) if (!listed(keep, d.id)) fs.rmSync(path.join(this.dir, hex(d.id)), { force: true });
+    for (const d of drop) if (!listed(keep, d.id)) this.st.remove("net-dicts/" + hex(d.id));
     this.slots.delete(peer);
     this.cache.delete(peer);
     this.gen++;

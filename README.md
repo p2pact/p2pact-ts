@@ -85,10 +85,29 @@ Calls reject with `ForbiddenError` (grants do not allow it, spec §8.1), `NoMeth
 keeps the JSON it was read from in `raw`. `P2pactClient.wrap(node)` puts the clients over a node you
 already run. See [`examples/client-cli`](examples/client-cli).
 
+## In a browser (`p2pact/browser`)
+
+An ESM bundle (about 250 KB, 100 KB gzipped, with the common dictionary and the zstd decoder
+embedded). The state lives in IndexedDB, the network is a relay over WebSocket
+(`p2pact-relay -ws-host …` of p2pact-go: `wss://`), and an application road (`node.attachRoad`)
+takes a WebRTC data channel. A browser decodes zstd (wasm, with dictionaries) and never compresses.
+
+```js
+import { createBrowserNode, Invite, KindClient } from "p2pact/browser";
+const node = await createBrowserNode({ name: "My page", db: "p2pact-1", relay: "wss://relay.example/", kind: KindClient });
+const peer = await node.join(Invite.parse(inviteString));
+const result = await node.call(peer.addr, tool, method, ...args);
+```
+
+The same classes work in Node.js with other parts: `new Node(storage, name, { codec })` takes a
+`Storage` (`FileStorage`, `IdbStorage`, `MemoryStorage`) and a `Codec`; `new Node(dir, name)`
+from `p2pact` is the Node.js flavour (files, node:zlib, UDP, TCP, the local socket).
+`node.setRelay(url)` listens on a WebSocket relay in either.
+
 ## Status
 
 Pairing, sessions, UDP and TCP roads, delivery with congestion control, messages,
-compression with the common dictionary and per-device own dictionaries, device kinds, named tools, grants, wants at pairing, the local socket road and plugins. Not yet: the relay road, the family tool, Bluetooth.
+compression with the common dictionary and per-device own dictionaries, device kinds, named tools, grants, wants at pairing, the local socket road and plugins. The relay road over WebSocket (browsers and Node.js). Not yet: the TLS relay road, the family tool, Bluetooth.
 
 ## Develop
 
