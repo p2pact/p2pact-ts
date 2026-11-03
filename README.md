@@ -41,11 +41,15 @@ await phone.call(peer.addr, 1, 2, 1, "run the tests");
   path, and the other side fetches it; `dictState` tells which one compresses now,
   `noLearning` turns training off.
 - `befriend` — add a device known from the family book without pairing.
+- `kind` — what the device is for (`KindComputer`, `KindClient`, `KindPlugin`), told in pairing and the hello (spec §1).
+- Named tools (spec §8): `registerTool` / `handleTool` / `callTool` / `toolNumber` — a tool has a reverse-domain name and each device numbers it itself; `handleToolAll` serves every method of a tool you host for another program.
+- Grants (spec §8.1): `setGrants` / `grant` / `revokeGrants` say what a trusted device may use (calls outside are error 4, events only with read); `markRead`, `handleLevel` mark read methods; `grantedBy` / `onGranted` tell what a device lets *you* use. `joinWants` asks at pairing, `onWants` lets the inviting application narrow or refuse.
+- Local programs (spec §2, §3): `listenLocal(path)` opens a Unix socket (mode 0600; a named pipe on Windows), `pluginEnv` gives a program it starts `P2PACT_SOCKET` and `P2PACT_INVITE`, and the program calls `newPlugin(dir, name)` to pair as a plugin. See [`examples/plugin-hello`](examples/plugin-hello).
 
 ## Status
 
 Pairing, sessions, UDP and TCP roads, delivery with congestion control, messages,
-compression with the common dictionary and per-device own dictionaries. Not yet: the relay road, the family tool, Bluetooth.
+compression with the common dictionary and per-device own dictionaries, device kinds, named tools, grants, wants at pairing, the local socket road and plugins. Not yet: the relay road, the family tool, Bluetooth.
 
 ## Develop
 
