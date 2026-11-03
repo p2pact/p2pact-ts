@@ -14,6 +14,9 @@
 //   {"cmd":"dict","raw":"<base64>"}                           → {"ok":true}
 //   {"cmd":"dict-state","peer":"…"}                           → {"own":"<base64>"|null,"using":…,"training":bool}
 //   {"cmd":"close"}
+// Kinds, named tools, grants, wants, the local socket and hosted tools: "kind", "peer-info", "tool",
+// "call-tool", "grant", "set-grants", "grants", "emit", "events", "on-wants", "local", "plugin-env", "proxy" and
+// join with "wants" (see p2pact-go/cmd/p2pact-interop for their JSON).
 // Errors: {"error":"…"}.
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -21,6 +24,7 @@ import * as path from "node:path";
 import { createInterface } from "node:readline";
 import { decode } from "./cbor.js";
 import { ErrFailed, later, Node, P2PACTError } from "./node.js";
+import type { Grant } from "./grants.js";
 import { Invite } from "./store.js";
 
 const dir = process.argv[2] ?? fs.mkdtempSync(path.join(os.tmpdir(), "p2pact-interop-"));
@@ -47,10 +51,18 @@ node.start();
 
 const say = (v: unknown) => process.stdout.write(JSON.stringify(v) + "\n");
 const b64 = (b: Uint8Array) => Buffer.from(b).toString("base64");
+const grantsIn = (l: [string, number][] | undefined): Grant[] => (l ?? []).map(([tool, level]) => ({ tool, level }));
+const grantsOut = (g: Grant[]) => g.map((x) => [x.tool, x.level]);
+const bytes = (s: string) => new Uint8Array(Buffer.from(s, "base64"));
+const events: { peer: string; tool: string; event: number; data: string }[] = [];
+const ownTools = new Map<string, number>();
+node.onEvent = (peer, tool, event, args) => {
+  events.push({ peer, tool: node.peerToolName(peer, tool), event, data: args.length ? b64(decode(args[0]) as Uint8Array) : "" });
+};
 
 for await (const line of createInterface({ input: process.stdin })) {
   if (!line.trim()) continue;
-  let req: Record<string, string>;
+  let req: Record<string, any>;
   try {
     req = JSON.parse(line);
   } catch {
@@ -68,7 +80,9 @@ for await (const line of createInterface({ input: process.stdin })) {
         say({ invite: node.invite(600_000).toString() });
         break;
       case "join":
-        say({ peer: (await node.join(Invite.parse(req.invite), 15_000)).addr });
+        const inv = Invite.parse(req.invite);
+        const p = req.wants ? await node.joinWants(inv, grantsIn(req.wants), 15_000) : await node.join(inv, 15_000);
+        say({ peer: p.addr });
         break;
       case "known":
         say({ known: !!node.trust.get(req.peer) });
@@ -97,6 +111,77 @@ for await (const line of createInterface({ input: process.stdin })) {
       case "dict-state": {
         const st = node.dictState(req.peer);
         say({ own: st.own && b64(st.own), using: st.using && b64(st.using), training: st.training });
+        break;
+      }
+      case "kind":
+        node.kind = req.kind;
+        say({ ok: true });
+        break;
+      case "peer-info":
+        say({ kind: node.trust.get(req.peer)?.kind ?? 0, tools: node.peerTools(req.peer), number: (req.tool && node.toolNumber(req.peer, req.tool)) ?? null });
+        break;
+      case "tool": {
+        const name: string = req.name;
+        const num = node.registerTool(name, 1);
+        ownTools.set(name, num);
+        const echo = (_p: string, args: Uint8Array[]) => [decode(args[0])];
+        node.handleTool(name, 1, echo);
+        node.handleTool(name, 2, echo);
+        node.handleTool(name, 3, () => [new TextEncoder().encode(name)]);
+        node.markRead(num, 1, 3);
+        say({ number: num });
+        break;
+      }
+      case "call-tool":
+        try {
+          const res = await node.callToolOn(req.peer, Number(req.stream ?? 0), req.name, req.method, bytes(req.data));
+          say({ data: b64(decode(res[0]) as Uint8Array) });
+        } catch (e) {
+          say({ error: (e as Error).message, code: e instanceof P2PACTError ? e.code : undefined });
+        }
+        break;
+      case "grant":
+        node.grant(req.peer, req.tool, req.level);
+        say({ ok: true });
+        break;
+      case "set-grants":
+        node.setGrants(req.peer, grantsIn(req.grants));
+        say({ ok: true });
+        break;
+      case "grants":
+        say({ allowed: grantsOut(node.grants(req.peer)), granted: grantsOut(node.grantedBy(req.peer)) });
+        break;
+      case "emit":
+        node.event(req.peer, ownTools.get(req.name)!, req.event, bytes(req.data));
+        say({ ok: true });
+        break;
+      case "events":
+        say({ events });
+        break;
+      case "on-wants": {
+        const max: number = req.level;
+        node.onWants = (_p, wants) => wants.map((g) => ({ tool: g.tool, level: Math.min(g.level, max) }));
+        say({ ok: true });
+        break;
+      }
+      case "local":
+        if (req.listen) await node.listenLocal(req.listen);
+        else await node.useLocal(req.use);
+        say({ ok: true });
+        break;
+      case "plugin-env": {
+        const env = node.pluginEnv(600_000, grantsIn(req.grants));
+        say({ socket: env.P2PACT_SOCKET, invite: env.P2PACT_INVITE });
+        break;
+      }
+      case "proxy": {
+        const name: string = req.name, plugin: string = req.plugin;
+        node.handleToolAll(name, async (_p, level, method, args) => {
+          if (method === 2 && level < 2) throw new P2PACTError(4, "forbidden");
+          const res = await node.callTool(plugin, name, method, ...args.map((a) => decode(a)));
+          return res.map((r) => decode(r));
+        });
+        say({ ok: true });
         break;
       }
       case "close":
