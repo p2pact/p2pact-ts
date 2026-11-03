@@ -5,7 +5,7 @@ import { compress, decompress, Dict, DictStore, dictId, has } from "./compress.j
 import { address, equal, hex, randomBytes } from "./crypto.js";
 import { dataHeader, keepalive, msgMax, Stream } from "./delivery.js";
 import { Learner, learnTiming } from "./learn.js";
-import { cleanGrants, grantLevel, grantsWire, isDefaultGrants, LevelRead, LevelWrite, parseGrants, type Grant } from "./grants.js";
+import { cleanGrants, defaultGrants, grantLevel, grantsWire, isDefaultGrants, LevelRead, LevelWrite, parseGrants, type Grant } from "./grants.js";
 import { FirstNamedTool, fixedTools, validToolName, type ToolRef } from "./tools.js";
 import { CipherState, concat, Handshake } from "./noise.js";
 import { endpointKey, TCPRoad, UDPRoad, type Endpoint, type Road } from "./roads.js";
@@ -92,6 +92,7 @@ interface PendingHandshake {
   done?: { resolve: () => void; reject: (e: Error) => void };
   at: number;
   remoteIdx?: number;
+  wants?: Grant[]; // pairing, we join: what we ask to use on the inviting device (spec §2)
   early: { pkt: Uint8Array; from: Endpoint }[];
 }
 
@@ -141,6 +142,8 @@ export interface PairInfo {
   signKey?: Uint8Array;
   os?: string;
   kind: number;
+  wants: Grant[];
+  hasWants: boolean; // the newcomer asked for something (spec §2); otherwise it asks for everything
 }
 
 /** @internal */
@@ -152,6 +155,7 @@ export function parsePair(b: Uint8Array): PairInfo {
   } catch {
     /* an unreadable payload reads as empty */
   }
+  const wants = a.length > 6 ? parseGrants(a[6]) : undefined;
   return {
     name: String(a[0] ?? ""),
     boot: typeof a[1] === "number" ? a[1] : 0,
@@ -159,6 +163,8 @@ export function parsePair(b: Uint8Array): PairInfo {
     signKey: a[3] instanceof Uint8Array ? a[3] : undefined,
     os: typeof a[4] === "string" ? a[4] : undefined,
     kind: typeof a[5] === "number" ? a[5] : KindUnknown,
+    wants: wants ?? [],
+    hasWants: wants !== undefined,
   };
 }
 
@@ -179,6 +185,12 @@ export class Node {
   onEvent?: (peer: string, tool: number, event: number, args: Uint8Array[]) => void | Promise<void>;
   onPaired?: (p: Peer) => void;
   /** onGranted is called when a known device tells what we may use of its tools (event 0.6). */
+  /** onWants is called on the inviting device when a newcomer has paired (spec §2), with what it
+   * asks to use (everything, if it did not say): the application shows it to its person and
+   * returns what the newcomer is granted, or null to refuse (the newcomer is forgotten). It may
+   * wait for the person; the newcomer can use nothing meanwhile. onPaired follows when it
+   * accepts. Unset — the newcomer gets what it asked for. */
+  onWants?: (p: Peer, wants: Grant[]) => Grant[] | null | Promise<Grant[] | null>;
   onGranted?: (peer: string, grants: Grant[]) => void;
   onHello?: (peer: string) => void;
   /** onHeld is called when messages from a device waited too long for a dictionary or its list
@@ -429,7 +441,15 @@ export class Node {
   }
 
   /** join pairs using an invite, trying all its hints until one answers. */
-  async join(inv: Invite, timeoutMs = 30_000): Promise<Peer> {
+  join(inv: Invite, timeoutMs = 30_000): Promise<Peer> {
+    return this.joinWants(inv, undefined, timeoutMs);
+  }
+
+  /** joinWants is {@link join} asking for permissions (spec §2, `wants`): what we want to use on
+   * the inviting device. Its person may narrow it; the result comes back as event 0.6
+   * ({@link grantedBy}, onGranted). undefined — we ask for everything, as between one person's
+   * own devices. */
+  async joinWants(inv: Invite, wants: Grant[] | undefined, timeoutMs = 30_000): Promise<Peer> {
     const eps: Endpoint[] = [];
     if (this.udp) for (const a of inv.hints.udp ?? []) eps.push({ road: this.udp, addr: a });
     if (this.tcp) for (const a of inv.hints.tcp ?? []) eps.push({ road: this.tcp, addr: a });
@@ -442,7 +462,7 @@ export class Node {
       const msg1 = hs.writeMessage();
       local = this.newIndex();
       const done = new Promise<void>((resolve, reject) => {
-        this.hs.set(local, { pair: true, hs, invite: inv, done: { resolve, reject }, at: Date.now(), early: [] });
+        this.hs.set(local, { pair: true, hs, invite: inv, done: { resolve, reject }, at: Date.now(), early: [], wants });
       });
       const pkt = concat(Uint8Array.of(pPair1), inv.id, be32(local), msg1);
       for (const e of eps) e.road.send(e.addr, pkt);
@@ -459,10 +479,12 @@ export class Node {
     }
   }
 
-  /** pairPayload is our payload; a device that does not say its kind sends the old five fields. */
-  private pairPayload(): Uint8Array {
+  /** pairPayload is our payload; wants are what we ask to use (undefined — not asking, the field
+   * is left out, and so is the kind if we do not say one: an older device gets what it knows). */
+  private pairPayload(wants?: Grant[]): Uint8Array {
     const a: CborValue[] = [this.name, this.boot, hintsToWire(this.hints()), this.id.sign.public, goos()];
-    if (this.kind !== KindUnknown) a.push(this.kind);
+    if (this.kind !== KindUnknown || wants) a.push(this.kind);
+    if (wants) a.push(grantsWire(cleanGrants(wants)));
     return encode(a);
   }
 
@@ -705,7 +727,7 @@ export class Node {
       return;
     }
     const pp = parsePair(payload);
-    const msg3 = h.hs.writeMessage(this.pairPayload());
+    const msg3 = h.hs.writeMessage(this.pairPayload(h.wants));
     const [c1, c2] = h.hs.ciphers!;
     this.hs.delete(local);
     const peer = address(inv.key);
@@ -742,6 +764,12 @@ export class Node {
     const pp = parsePair(payload);
     const p: Peer = { addr: peer, key: key.slice(), name: pp.name, pairSecret: inv.secret,
       hints: pp.hints, added: 0, signKey: pp.signKey, os: pp.os, kind: pp.kind || undefined, via: hex(inv.id) };
+    // what the newcomer may use (spec §2): without wants it asks for everything and keeps the
+    // default; with them, and no onWants to narrow them, it gets what it asked. With onWants
+    // the application decides: until it does the newcomer may use nothing.
+    if (pp.hasWants) p.grants = cleanGrants(pp.wants);
+    const on = this.onWants;
+    if (on) p.grants = [];
     this.trust.put(p);
     const s: Session = { peer, local, remote: h.remoteIdx!, send: c2, recv: c1, sendN: 0, win: new Window(), lastRecv: now };
     this.sessions.set(local, s);
@@ -749,6 +777,26 @@ export class Node {
     const ps = this.peerState(peer)!;
     this.seen(ps, from, now, s.local);
     this.bootOf(ps, pp.boot);
+    if (on) {
+      const wants = pp.hasWants ? cleanGrants(pp.wants) : defaultGrants();
+      this.sendInfo(peer);
+      void (async () => {
+        let grants: Grant[] | null = null;
+        try {
+          grants = await on(p, wants);
+        } catch {
+          /* a failing application refuses */
+        }
+        if (!grants) {
+          this.forget(peer);
+          return;
+        }
+        if (!this.trust.get(peer)) return; // forgotten meanwhile
+        this.setGrants(peer, grants);
+        if (this.onPaired) this.onPaired(this.trust.get(peer)!);
+      })();
+      return;
+    }
     this.paired(p);
   }
 

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { decode, Invite, Node, P2PACTError } from "../src/index.js";
+import { decode, Invite, Node, P2PACTError, type Grant } from "../src/index.js";
 
 export const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "p2pact-ts-"));
 
@@ -21,9 +21,9 @@ export async function node(name: string, udp = true, kind = 0): Promise<Node> {
   return n;
 }
 
-export async function pair(a: Node, b: Node) {
+export async function pair(a: Node, b: Node, wants?: Grant[]) {
   const inv = Invite.parse(a.invite(60_000).toString());
-  const p = await b.join(inv, 10_000);
+  const p = await b.joinWants(inv, wants, 10_000);
   assert.equal(p.addr, a.id.addr);
   await eventually("the inviter remembers the joiner", () => !!a.trust.get(b.id.addr));
 }
