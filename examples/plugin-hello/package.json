@@ -1,0 +1,10 @@
+{
+  "name": "plugin-hello",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Example P2PACT plugin for Node.js",
+  "dependencies": {
+    "p2pact": "file:../.."
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "name": "dev.p2pact.example.hello.ts",
+  "version": "0.1.0",
+  "title": "Hello example (Node.js)",
+  "run": ["node", "plugin.mjs"],
+  "tools": ["dev.p2pact.example.hello.ts"],
+  "read": {"dev.p2pact.example.hello.ts": [1]},
+  "needs": [],
+  "platforms": ["darwin", "linux", "windows"]
+}
