@@ -5,7 +5,7 @@ import { compress, decompress, Dict, DictStore, dictId, has } from "./compress.j
 import { address, equal, hex, randomBytes } from "./crypto.js";
 import { dataHeader, keepalive, msgMax, Stream, type StreamId } from "./delivery.js";
 import { Learner, learnTiming } from "./learn.js";
-import { cleanGrants, defaultGrants, grantLevel, grantsWire, isDefaultGrants, LevelRead, LevelWrite, parseGrants, type Grant } from "./grants.js";
+import { cleanGrants, defaultGrants, grantLevel, grantsWire, LevelRead, LevelWrite, parseGrants, type Grant } from "./grants.js";
 import { FirstNamedTool, fixedTools, validToolName, type ToolRef } from "./tools.js";
 import { CipherState, concat, Handshake } from "./noise.js";
 import { LocalRoad } from "./local.js";
@@ -396,11 +396,12 @@ export class Node {
     this.setGrants(peer, []);
   }
 
-  /** grantsEvent tells the device what it may use, unless that is the default it assumes. */
+  /** grantsEvent tells the device what it may use, unless we never set it (the default it assumes).
+   * A newcomer that asked has an explicit set, even ["*", 2]: it waits for this event (spec §2). */
   private grantsEvent(peer: string) {
     const p = this.trust.get(peer);
     const ps = this.peers.get(peer);
-    if (!p || !ps || isDefaultGrants(p.grants)) return;
+    if (!p || !ps || !p.grants) return;
     this.push(ps, encode([3, 0, 6, grantsWire(p.grants!)]));
   }
 
@@ -534,8 +535,8 @@ export class Node {
 
   /** joinWants is {@link join} asking for permissions (spec §2, `wants`): what we want to use on
    * the inviting device. Its person may narrow it; the result comes back as event 0.6
-   * ({@link grantedBy}, onGranted). undefined — we ask for everything, as between one person's
-   * own devices. */
+   * ({@link grantedBy}, onGranted); until the first 0.6 the device grants us nothing. undefined — we
+   * ask for everything, as between one person's own devices (everything until told). */
   async joinWants(inv: Invite, wants: Grant[] | undefined, timeoutMs = 30_000): Promise<Peer> {
     const eps: Endpoint[] = [];
     if (this.udp) for (const a of inv.hints.udp ?? []) eps.push({ road: this.udp, addr: a });
@@ -827,7 +828,8 @@ export class Node {
     hints.tcp ??= inv.hints.tcp;
     hints.relay ??= inv.hints.relay;
     const p: Peer = { addr: peer, key: inv.key, name: pp.name, pairSecret: inv.secret, hints, added: 0,
-      signKey: pp.signKey, os: pp.os, kind: pp.kind || undefined, local: this.isLocal(from) || undefined };
+      signKey: pp.signKey, os: pp.os, kind: pp.kind || undefined, local: this.isLocal(from) || undefined,
+      granted: h.wants ? [] : undefined }; // asked: nothing until the first 0.6 (spec §2)
     this.trust.put(p);
     const s: Session = { peer, local, remote: u32(pkt, 5), send: c1, recv: c2, sendN: 0, win: new Window(), lastRecv: now };
     this.sessions.set(local, s);

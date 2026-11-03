@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { Invite, AllTools, allowed, defaultGrants, ErrForbidden, KindClient, LevelRead, LevelWrite, type Grant, type Peer } from "../src/index.js";
-import { close, code, echo, eventually, node, pair } from "./util.js";
+import { Invite, Node, Trust, AllTools, allowed, defaultGrants, ErrForbidden, KindClient, LevelRead, LevelWrite, type Grant, type Peer } from "../src/index.js";
+import { close, code, echo, eventually, node, pair, tmp } from "./util.js";
 
 test("wants asked are granted", async () => {
   const a = await node("Mac"), b = await node("App", true, KindClient);
@@ -75,6 +75,46 @@ test("wants refused", async () => {
     await eventually("asked", () => !!got);
     assert.deepEqual(got, defaultGrants());
     await eventually("forgotten", () => a.trust.get(b.id.addr) === undefined);
+  } finally {
+    close(a, b);
+  }
+});
+
+// A newcomer that asked and is not yet answered may use nothing (kept over a restart); one that did not ask has everything.
+test("wants: nothing until the first 0.6", async () => {
+  const dir = tmp();
+  const a = await node("Mac"), c = await node("Phone");
+  const b = new Node(dir, "App");
+  await b.listenUDP("127.0.0.1:0");
+  b.kind = KindClient;
+  b.start();
+  try {
+    let release!: () => void;
+    const released = new Promise<void>((r) => (release = r));
+    a.onWants = async () => {
+      await released;
+      return [{ tool: "com.acme.x", level: LevelRead }];
+    };
+    await pair(a, b, [{ tool: "com.acme.x", level: LevelWrite }]);
+    assert.deepEqual(b.grantedBy(a.id.addr), []);
+    assert.deepEqual(new Trust(dir).get(a.id.addr)!.granted, [], "kept over a restart");
+    release();
+    await eventually("told", () => JSON.stringify(b.grantedBy(a.id.addr)) === JSON.stringify([{ tool: "com.acme.x", level: LevelRead }]));
+    a.onWants = undefined;
+    await pair(a, c);
+    assert.deepEqual(c.grantedBy(a.id.addr), defaultGrants());
+  } finally {
+    close(a, b, c);
+  }
+});
+
+// Asked for everything and got it: still told by 0.6, or the newcomer would wait for ever.
+test("wants: everything is told", async () => {
+  const a = await node("Mac"), b = await node("App", true, KindClient);
+  try {
+    await pair(a, b, [{ tool: AllTools, level: LevelWrite }]);
+    await eventually("told everything", () => b.trust.get(a.id.addr)!.granted?.length === 1);
+    assert.deepEqual(b.grantedBy(a.id.addr), defaultGrants());
   } finally {
     close(a, b);
   }

@@ -79,7 +79,7 @@ export interface Peer {
   /** what we let this device use of ours (spec §8.1); undefined — never set, which is ["*", 2]:
    * a person's own device uses everything. An empty list grants nothing. */
   grants?: Grant[];
-  /** what the device lets us use of its tools (its event 0.6); undefined — not told, ["*", 2] too */
+  /** what the device lets us use of its tools (its event 0.6); undefined — not told, ["*", 2] too; joined with wants: [] until the first 0.6 */
   granted?: Grant[];
   /** we reach the device over our local socket (a plugin's host, spec §3) */
   local?: boolean;

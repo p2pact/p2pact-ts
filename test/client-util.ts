@@ -156,11 +156,9 @@ export class Harness {
     if (decide) this.engine.decide = decide;
     this.client = await P2pactClient.open(tmp(), "Test app", { udp: "127.0.0.1:0", tcp: null });
     const events = this.client.computerEvents;
-    // the narrowed or given grants (event 0.6) come right after pairing, unless they are everything
-    const everything = JSON.stringify(this.engine.decide([...wants])) === JSON.stringify([{ tool: "*", level: 2 }]);
-    // (before the person decides, the newcomer is told it may use nothing: wait for the decision)
+    // before the person decides the newcomer may use nothing: wait for the decision (event 0.6, always sent to one that asked)
     const expected = JSON.stringify(this.engine.decide([...wants]));
-    const granted = everything || wants.length === 0 ? undefined
+    const granted = wants.length === 0 ? undefined
       : events.next({ filter: (e: ComputerEvent) => e.type === "grantsChanged" && JSON.stringify(e.grants) === expected });
     const computer = await this.client.pair(this.engine.invite(), wants);
     await computer.whenOnline();
