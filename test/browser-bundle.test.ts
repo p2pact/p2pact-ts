@@ -9,7 +9,7 @@ import { pathToFileURL } from "node:url";
 import { IDBFactory } from "fake-indexeddb";
 import { zlibCodec } from "../src/compress-node.js";
 import { frameCompress, Dict } from "../src/compress.js";
-import { WasmCodec } from "../src/codec-wasm.js";
+import { contentSize, WasmCodec } from "../src/codec-wasm.js";
 import { commonDict } from "../src/common.js";
 import { randomBytes } from "../src/crypto.js";
 import { bundle } from "./browser-util.js";
@@ -31,6 +31,12 @@ test("the wasm decoder reads what node:zlib compresses, with and without a dicti
     }
   }
   assert.equal(codec.compress(), null, "a browser never compresses");
+  // a frame with no declared size (the Go library writes those): one raw block, no size field
+  const raw = new TextEncoder().encode("a frame that declares no content size");
+  const noSize = Uint8Array.of(0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00, ((raw.length << 3) | 1) & 255, (raw.length << 3) >> 8, 0, ...raw);
+  assert.equal(contentSize(noSize), -1);
+  assert.deepEqual(codec.decompress(noSize, null, 1 << 20), raw, "a stream decode when the size is not declared");
+  assert.throws(() => codec.decompress(noSize, null, 10), /too big/, "the limit is checked on what came out");
   const big = frameCompress(zlibCodec, randomBytes(50_000).map((x) => x & 7), null, 0)!;
   assert.throws(() => frameDecompress(codec, big, null, 1000), /too big|unknown/, "output beyond the limit is refused");
   assert.throws(() => frameDecompress(codec, Uint8Array.of(0, 1, 2, 3, 4, 5, 6, 7), null, 1000));

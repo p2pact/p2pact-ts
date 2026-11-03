@@ -46,15 +46,22 @@ export class WasmCodec implements Codec {
 
   decompress(frame: Uint8Array, d: Dict | null, max: number): Uint8Array {
     const size = contentSize(frame);
-    if (size < 0 || size > max) throw new Error("zstd: size unknown or too big");
+    if (size > max) throw new Error("zstd: too big");
+    if (size < 0) {
+      // the Go library writes frames without a declared size (small messages, dictionary
+      // encoders): decode as a stream and check the limit on what came out
+      const streamed = this.decoder(d).decompressStream(frame, true).buf;
+      if (streamed.length > max) throw new Error("zstd: too big");
+      return streamed;
+    }
     const out = this.decoder(d).decompressSync(frame, size);
     if (out.length !== size) throw new Error("zstd: size mismatch");
     return out;
   }
 }
 
-/** contentSize reads the frame's declared decompressed size; -1 if it declares none (we do not
- * decode those: the output could not be bounded). */
+/** contentSize reads the frame's declared decompressed size; -1 if it declares none (decoded as a
+ * stream, the limit checked afterwards). */
 export function contentSize(f: Uint8Array): number {
   if (f.length < 6) return -1;
   const fhd = f[4];
