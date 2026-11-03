@@ -7,3 +7,4 @@ export { encode, decode, decodeArrayRaw, Raw, type CborValue } from "./cbor.js";
 export { address } from "./crypto.js";
 export { Dict, dictId } from "./compress.js";
 export { commonDict } from "./common.js";
+export { validToolName, FirstNamedTool, fixedTools, type ToolRef } from "./tools.js";

@@ -5,6 +5,7 @@ import { compress, decompress, Dict, DictStore, dictId, has } from "./compress.j
 import { address, equal, hex, randomBytes } from "./crypto.js";
 import { dataHeader, keepalive, msgMax, Stream } from "./delivery.js";
 import { Learner, learnTiming } from "./learn.js";
+import { FirstNamedTool, fixedTools, validToolName, type ToolRef } from "./tools.js";
 import { CipherState, concat, Handshake } from "./noise.js";
 import { endpointKey, TCPRoad, UDPRoad, type Endpoint, type Road } from "./roads.js";
 import { hintsFromWire, hintsToWire, Identity, Invite, Prologue, Trust, type Hints, type Peer } from "./store.js";
@@ -113,6 +114,7 @@ interface PeerState {
   askingInfo: boolean; // our 0.2 info call is on its way (askInfo)
   askedInfo: number; // when we asked
   tried: Uint8Array[]; // dictionaries of its list we asked it for and did not get
+  named?: Map<string, ToolRef>; // its named tools, from its hello (spec §8)
   sysCalls: Set<number>; // our calls of tool 0: their results are not conversation
   inbox: Map<number, (() => Promise<void> | void)[]>; // calls and events waiting for their turn, per stream
 }
@@ -192,6 +194,10 @@ export class Node {
   private invites = new Map<string, Invite>();
   private peers = new Map<string, PeerState>();
   private handlers = new Map<string, Handler>();
+  // named tools: name → number and back, versions
+  private names = new Map<string, number>();
+  private numbers = new Map<number, string>();
+  private versions = new Map<number, number>();
   private resetAt = new Map<string, number>();
   private dicts: DictStore;
   private learner: Learner;
@@ -248,6 +254,88 @@ export class Node {
    * handler that waits long returns {@link later}, so that the stream goes on without it. */
   handle(tool: number, method: number, h: Handler) {
     this.handlers.set(`${tool}.${method}`, h);
+  }
+
+  // --- named tools (spec §8) ---
+
+  /** registerTool gives a tool of ours a name and picks its number: the first one from 64 up that
+   * no other tool of ours uses. The same name gets the same number for the rest of the run. The
+   * number is announced in the hello's named map, and the devices in session get the new hello
+   * at once. Other devices may number the same name differently: callers use {@link toolNumber}. */
+  registerTool(name: string, version = 1): number {
+    if (!validToolName(name)) throw new Error("bad tool name: " + name);
+    const old = this.names.get(name);
+    if (old !== undefined) {
+      if (this.versions.get(old) !== version) {
+        this.versions.set(old, version);
+        this.reannounceTools();
+      }
+      return old;
+    }
+    let num = FirstNamedTool;
+    while (this.toolUsed(num)) num++;
+    this.names.set(name, num);
+    this.numbers.set(num, name);
+    this.versions.set(num, version);
+    this.reannounceTools();
+    return num;
+  }
+
+  private toolUsed(num: number): boolean {
+    if (this.numbers.has(num)) return true;
+    for (const k of this.handlers.keys()) if (Number(k.split(".")[0]) === num) return true;
+    return false;
+  }
+
+  private reannounceTools() {
+    for (const peer of this.current.keys()) this.sendInfo(peer);
+  }
+
+  /** handleTool is {@link handle} by tool name (the tool is registered at version 1 if it is not yet). */
+  handleTool(name: string, method: number, h: Handler) {
+    const num = fixedTools[name] ?? this.registerTool(name, 1);
+    this.handle(num, method, h);
+  }
+
+  /** toolName is the name of a tool of ours by its number ("" — it has none: a number of the
+   * implementation's own). */
+  toolName(tool: number): string {
+    for (const [name, num] of Object.entries(fixedTools)) if (num === tool) return name;
+    return this.numbers.get(tool) ?? "";
+  }
+
+  /** toolNumber resolves a tool name to the number the device announced for it in its hello (spec
+   * §8); the tools of the spec have their fixed numbers. undefined — the device has not announced
+   * it (or we have not heard its hello yet). */
+  toolNumber(peer: string, name: string): number | undefined {
+    return fixedTools[name] ?? this.peers.get(peer)?.named?.get(name)?.number;
+  }
+
+  /** peerToolName is the name of a tool of a device by the number it announced: what an onEvent
+   * handler needs ("" — unnamed). */
+  peerToolName(peer: string, tool: number): string {
+    for (const [name, num] of Object.entries(fixedTools)) if (num === tool) return name;
+    for (const [name, ref] of this.peers.get(peer)?.named ?? []) if (ref.number === tool) return name;
+    return "";
+  }
+
+  /** callTool is {@link call} by tool name: the number is the device's own. */
+  callTool(peer: string, name: string, method: number, ...args: unknown[]): Promise<Uint8Array[]> {
+    return this.callToolOn(peer, 0, name, method, ...args);
+  }
+
+  /** callToolOn is {@link callOn} by tool name. */
+  callToolOn(peer: string, stream: number, name: string, method: number, ...args: unknown[]): Promise<Uint8Array[]> {
+    const num = this.toolNumber(peer, name);
+    if (num === undefined) return Promise.reject(new P2PACTError(ErrNoMethod, "the device has no tool " + name));
+    return this.callOn(peer, stream, num, method, ...args);
+  }
+
+  /** namedMap is the hello's named map: {name: [tool, version]}. */
+  private namedMap(): CborValue {
+    const out = new Map<CborValue, CborValue>();
+    for (const [name, num] of this.names) out.set(name, [num, this.versions.get(num) ?? 1]);
+    return out;
   }
 
   // --- pairing ---
@@ -375,9 +463,9 @@ export class Node {
     const tools = new Map<CborValue, CborValue>();
     for (const k of this.handlers.keys()) {
       const t = Number(k.split(".")[0]);
-      if (t !== 0) tools.set(t, 1);
+      if (t !== 0 && !this.numbers.has(t)) tools.set(t, 1);
     }
-    return [this.name, goos(), "p2pact-ts", tools, this.dicts.ids(peer), hintsToWire(this.hints()), this.kind];
+    return [this.name, goos(), "p2pact-ts", tools, this.dicts.ids(peer), hintsToWire(this.hints()), this.kind, this.namedMap()];
   }
 
   private hints(): Hints {
@@ -660,6 +748,8 @@ export class Node {
           const kind = decode(a[9]);
           if (typeof kind === "number") this.trust.setKind(peer, kind);
         }
+        ps.named = undefined;
+        if (a.length >= 11) ps.named = parseNamed(decode(a[10]));
         ps.dicts = idsOf(decode(a[7]));
         ps.lacks = [];
         ps.tried = [];
@@ -1130,6 +1220,18 @@ export class Node {
 /** initGap: retry a handshake after three measured round trips (250 ms – 2 s), else 1 s. */
 function initGap(ps: PeerState): number {
   return ps.st.srtt === 0 ? initEvery : Math.min(Math.max(3 * ps.st.srtt, 250), 2000);
+}
+
+/** parseNamed reads the hello's {name: [tool, version]}; undefined — not a map. */
+function parseNamed(v: CborValue): Map<string, ToolRef> | undefined {
+  if (!(v instanceof Map)) return undefined;
+  const out = new Map<string, ToolRef>();
+  for (const [name, r] of v) {
+    if (typeof name === "string" && Array.isArray(r) && r.length >= 2 && typeof r[0] === "number" && typeof r[1] === "number") {
+      out.set(name, { number: r[0], version: r[1] });
+    }
+  }
+  return out;
 }
 
 function idsOf(v: CborValue): Uint8Array[] {
