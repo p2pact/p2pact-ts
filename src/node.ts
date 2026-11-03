@@ -3,7 +3,7 @@
 import { decode, decodeArrayRaw, encode, type CborValue } from "./cbor.js";
 import { compress, decompress, Dict, DictStore, dictId, has } from "./compress.js";
 import { address, equal, hex, randomBytes } from "./crypto.js";
-import { dataHeader, keepalive, msgMax, Stream } from "./delivery.js";
+import { dataHeader, keepalive, msgMax, Stream, type StreamId } from "./delivery.js";
 import { Learner, learnTiming } from "./learn.js";
 import { cleanGrants, defaultGrants, grantLevel, grantsWire, isDefaultGrants, LevelRead, LevelWrite, parseGrants, type Grant } from "./grants.js";
 import { FirstNamedTool, fixedTools, validToolName, type ToolRef } from "./tools.js";
@@ -120,7 +120,7 @@ interface PeerState {
   callID: number;
   dicts: Uint8Array[]; // its dictionaries (ids), by slot — from its hello and 0.5
   lacks: Uint8Array[]; // it asked us for these, so it lacks them until it announces again
-  waiting: { msg: Uint8Array; zip: boolean; stream: number }[]; // waiting for a dictionary (spec §5)
+  waiting: { msg: Uint8Array; zip: boolean; stream: StreamId }[]; // waiting for a dictionary (spec §5)
   waitSince: number; // when the head of waiting started to wait (unhold unblocks it)
   fetching: boolean;
   askingInfo: boolean; // our 0.2 info call is on its way (askInfo)
@@ -128,7 +128,7 @@ interface PeerState {
   tried: Uint8Array[]; // dictionaries of its list we asked it for and did not get
   named?: Map<string, ToolRef>; // its named tools, from its hello (spec §8)
   sysCalls: Set<number>; // our calls of tool 0: their results are not conversation
-  inbox: Map<number, (() => Promise<void> | void)[]>; // calls and events waiting for their turn, per stream
+  inbox: Map<StreamId, (() => Promise<void> | void)[]>; // calls and events waiting for their turn, per stream
 }
 
 /** Kinds of device (spec §1): what a device is for, told in the pairing payload and the hello. */
@@ -479,7 +479,7 @@ export class Node {
   }
 
   /** callToolOn is {@link callOn} by tool name. */
-  callToolOn(peer: string, stream: number, name: string, method: number, ...args: unknown[]): Promise<Uint8Array[]> {
+  callToolOn(peer: string, stream: StreamId, name: string, method: number, ...args: unknown[]): Promise<Uint8Array[]> {
     const num = this.toolNumber(peer, name);
     if (num === undefined) return Promise.reject(new P2PACTError(ErrNoMethod, "the device has no tool " + name));
     return this.callOn(peer, stream, num, method, ...args);
@@ -610,7 +610,7 @@ export class Node {
   }
 
   /** callOn is call on a stream: ordered within it, independent of other streams (one per chat). */
-  callOn(peer: string, stream: number, tool: number, method: number, ...args: unknown[]): Promise<Uint8Array[]> {
+  callOn(peer: string, stream: StreamId, tool: number, method: number, ...args: unknown[]): Promise<Uint8Array[]> {
     if (this.closed) return Promise.reject(new Error("node closed"));
     const ps = this.peerState(peer);
     if (!ps) return Promise.reject(new Error("unknown device"));
@@ -637,7 +637,7 @@ export class Node {
     this.eventOn(peer, 0, tool, ev, ...args);
   }
 
-  eventOn(peer: string, stream: number, tool: number, ev: number, ...args: unknown[]) {
+  eventOn(peer: string, stream: StreamId, tool: number, ev: number, ...args: unknown[]) {
     const ps = this.peerState(peer);
     if (!ps) throw new Error("unknown device");
     // a tool's events go only to devices with at least read on it (spec §8.1)
@@ -918,7 +918,7 @@ export class Node {
     this.grantsEvent(peer);
   }
 
-  private message(peer: string, msg: Uint8Array, stream = 0) {
+  private message(peer: string, msg: Uint8Array, stream: StreamId = 0) {
     let a: Uint8Array[];
     try {
       a = decodeArrayRaw(msg);
@@ -1032,7 +1032,7 @@ export class Node {
 
   /** enqueue runs f behind the stream's earlier calls and events, one at a time, in the order
    * they came (spec §6). Each stream drains on its own: a slow handler holds up its stream only. */
-  private enqueue(ps: PeerState, stream: number, f: () => Promise<void> | void) {
+  private enqueue(ps: PeerState, stream: StreamId, f: () => Promise<void> | void) {
     const q = ps.inbox.get(stream);
     if (q) {
       q.push(f);
@@ -1250,7 +1250,7 @@ export class Node {
    * through event 0.5, which travels in the same order as messages. talk: the message is
    * conversation (not tool 0), so it goes to the history (learn.ts); reply: a result or error,
    * dropped if the other device restarts (spec §4.2). */
-  private push(ps: PeerState, msg: Uint8Array, stream = 0, talk = false, reply = false) {
+  private push(ps: PeerState, msg: Uint8Array, stream: StreamId = 0, talk = false, reply = false) {
     if (this.noCompression || bootstrap(msg)) {
       ps.st.push(msg, false, stream, reply);
       this.wake();
@@ -1274,7 +1274,7 @@ export class Node {
    * dictionary; if we do not know the sender's list yet (it restarted), we wait for its hello.
    * While waiting, only replies to our calls (the dictionary among them), hellos and dictionary
    * lists run out of order: nothing depends on their order. */
-  private inbound(peer: string, msg: Uint8Array, zip: boolean, stream = 0) {
+  private inbound(peer: string, msg: Uint8Array, zip: boolean, stream: StreamId = 0) {
     const ps = this.peerState(peer);
     if (!ps) return;
     if (ps.waiting.length > 0) {

@@ -29,12 +29,18 @@ const cwndMax = 4096;
 const gotMax = 8192;
 export const msgMax = 16 << 20;
 
+/** StreamId names a stream: 0 is the ordered default, others are up to 64 bits (a chat's is the
+ * hash of its id): a number while it is safe and a bigint beyond, so that it stays exact. */
+export type StreamId = number | bigint;
+
+const streamKey = (n: bigint): StreamId => (n <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(n) : n);
+
 interface Part {
   seq: number;
   data: Uint8Array;
   more: boolean;
   zip: boolean;
-  stream: number;
+  stream: StreamId;
   num: number;
   firstOfStream: boolean;
   reply: boolean; // part of a result or error: it answers a call of this boot only
@@ -84,14 +90,14 @@ export class Stream {
   bw = 0; // bytes per ms
   bwAt = 0;
 
-  snext = new Map<number, number>();
+  snext = new Map<StreamId, number>();
   recvAck = 1; // first part not received yet
   got = new Map<number, RPart>();
   next0 = 1;
   asm0: Uint8Array[] = [];
   asm0Len = 0;
   zip0 = false;
-  streams = new Map<number, { next: number; ready: Map<number, { msg: Uint8Array; zip: boolean }> }>();
+  streams = new Map<StreamId, { next: number; ready: Map<number, { msg: Uint8Array; zip: boolean }> }>();
   ackDue = 0;
   unacked = 0;
 
@@ -200,7 +206,7 @@ export class Stream {
 
   /** push queues a message in parts on a stream (0 — the ordered default); zip — compressed,
    * reply — a result or error. */
-  push(msg: Uint8Array, zip: boolean, stream = 0, reply = false) {
+  push(msg: Uint8Array, zip: boolean, stream: StreamId = 0, reply = false) {
     let num = 0;
     if (stream !== 0) {
       num = (this.snext.get(stream) ?? 0) + 1;
@@ -296,7 +302,7 @@ export class Stream {
   }
 
   /** receive handles packet content; deliver gets each message as it becomes deliverable. */
-  receive(now: number, b: Uint8Array, deliver: (msg: Uint8Array, zip: boolean, stream: number) => void) {
+  receive(now: number, b: Uint8Array, deliver: (msg: Uint8Array, zip: boolean, stream: StreamId) => void) {
     if (b.length === 0) throw new Error("empty packet");
     const flags = b[0];
     let pos = 1;
@@ -370,7 +376,7 @@ export class Stream {
       const [st, q1] = readUvarint(b, pos);
       const [num, q2] = readUvarint(b, q1);
       pos = q2;
-      Object.assign(r, { first: true, streamed: true, stream: Number(st), num: Number(num) });
+      Object.assign(r, { first: true, streamed: true, stream: streamKey(st), num: Number(num) });
     } else if (flags & fCont) r.streamed = true;
     const seq = Number(seq64);
     if (this.ackDue === 0) this.ackDue = now + ackDelay;
@@ -384,7 +390,7 @@ export class Stream {
     for (const [k, x] of this.got) if (x.used && k < this.recvAck && k < this.next0) this.got.delete(k);
   }
 
-  private assemble(seq: number, deliver: (m: Uint8Array, z: boolean, s: number) => void) {
+  private assemble(seq: number, deliver: (m: Uint8Array, z: boolean, s: StreamId) => void) {
     let start = seq;
     for (;;) {
       const x = this.got.get(start);
@@ -423,7 +429,7 @@ export class Stream {
     }
   }
 
-  private take0(deliver: (m: Uint8Array, z: boolean, s: number) => void) {
+  private take0(deliver: (m: Uint8Array, z: boolean, s: StreamId) => void) {
     for (;;) {
       const x = this.got.get(this.next0);
       if (!x) return;
@@ -463,7 +469,7 @@ interface RPart {
   first: boolean;
   streamed: boolean;
   used: boolean;
-  stream: number;
+  stream: StreamId;
   num: number;
 }
 

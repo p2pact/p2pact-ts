@@ -9,5 +9,6 @@ export { Dict, dictId } from "./compress.js";
 export { commonDict } from "./common.js";
 export { validToolName, FirstNamedTool, fixedTools, type ToolRef } from "./tools.js";
 export { LevelRead, LevelWrite, AllTools, defaultGrants, grantLevel, type Grant } from "./grants.js";
+export type { StreamId } from "./delivery.js";
 export { LocalRoad } from "./local.js";
 export { newPlugin, EnvSocket, EnvInvite } from "./plugin.js";
