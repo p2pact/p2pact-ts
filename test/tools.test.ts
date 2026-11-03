@@ -1,8 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { decode, encode, FirstNamedTool, validToolName } from "../src/index.js";
+import { decode, encode, ErrForbidden, FirstNamedTool, LevelRead, LevelWrite, P2PACTError, validToolName } from "../src/index.js";
 import { hintsToWire } from "../src/store.js";
-import { close, echo, eventually, node, pair } from "./util.js";
+import { close, code, echo, eventually, node, pair } from "./util.js";
 
 test("valid tool names", () => {
   const want: Record<string, boolean> = { "com.example.jira": true, "org.a-b.c1": true, jira: false, "": false,
@@ -56,6 +56,37 @@ test("named tools: an old hello", async () => {
     (a as any).message(b.id.addr, encode([3, 0, 2, "Old", "linux", "old-impl", new Map([[64, 1]]), [], hintsToWire({})]), 0);
     assert.equal(a.toolNumber(b.id.addr, "com.acme.one"), undefined, "an old hello named a tool");
     await echo(a, b, new TextEncoder().encode("numbered"));
+  } finally {
+    close(a, b);
+  }
+});
+
+// A hosted tool: one handler for all methods, the node requires read, the handler decides the
+// rest; the tool leaves the hello when unregistered; peerTools lists what a device announced.
+test("a tool-wide handler", async () => {
+  const a = await node("Mac"), b = await node("Phone");
+  try {
+    a.handleToolAll("com.acme.host", (_peer, level, method) => {
+      if (method >= 10 && level < LevelWrite) throw new P2PACTError(ErrForbidden, "read only");
+      return [method];
+    });
+    await pair(a, b);
+    await eventually("hello", () => b.toolNumber(a.id.addr, "com.acme.host") !== undefined);
+    assert.deepEqual(b.peerTools(a.id.addr), ["com.acme.host"]);
+    a.setGrants(b.id.addr, [{ tool: "com.acme.host", level: LevelRead }]);
+    const call = (m: number) => code(b.callTool(a.id.addr, "com.acme.host", m));
+    assert.equal(await call(3), 0, "read method");
+    assert.equal(await call(12), ErrForbidden, "write method at read");
+    a.setGrants(b.id.addr, [{ tool: "com.acme.host", level: LevelWrite }]);
+    assert.equal(await call(12), 0, "write method");
+    a.setGrants(b.id.addr, []);
+    assert.equal(await call(3), ErrForbidden, "no grant");
+    // a method registered on its own keeps its handler, and its own (write) level
+    a.handleTool("com.acme.host", 20, () => ["own"]);
+    a.setGrants(b.id.addr, [{ tool: "com.acme.host", level: LevelRead }]);
+    assert.equal(await call(20), ErrForbidden, "own method needs write");
+    a.unregisterTool("com.acme.host");
+    await eventually("gone from hello", () => b.peerTools(a.id.addr).length === 0);
   } finally {
     close(a, b);
   }

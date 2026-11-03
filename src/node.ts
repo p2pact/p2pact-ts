@@ -44,6 +44,10 @@ export type Handler = (peer: string, args: Uint8Array[]) => CborValue[] | Later 
  * one P2PACT method for all of ACP), where what a call needs depends on its arguments. */
 export type LevelHandler = (peer: string, level: number, args: Uint8Array[]) => CborValue[] | Later | Promise<CborValue[] | Later>;
 
+/** ToolHandler is one handler for every method of a tool (see {@link Node.handleToolAll}): it gets
+ * the method number and the caller's level (1 or 2), and checks the level itself. */
+export type ToolHandler = (peer: string, level: number, method: number, args: Uint8Array[]) => CborValue[] | Later | Promise<CborValue[] | Later>;
+
 /** Later is a reply taken out of the stream's turn: see {@link later}. */
 export class Later {
   /** @internal */
@@ -223,6 +227,7 @@ export class Node {
   // grants: methods that check the level themselves, methods marked read
   private levelHandlers = new Map<string, LevelHandler>();
   private readMethods = new Set<string>();
+  private toolHandlers = new Map<number, ToolHandler>(); // one handler for all methods of a tool (handleToolAll)
   private names = new Map<string, number>();
   private numbers = new Map<number, string>();
   private versions = new Map<number, number>();
@@ -402,7 +407,7 @@ export class Node {
   /** requiredLevel is the level a call needs. */
   private requiredLevel(tool: number, method: number): number {
     const k = `${tool}.${method}`;
-    return this.levelHandlers.has(k) || this.readMethods.has(k) ? LevelRead : LevelWrite;
+    return this.levelHandlers.has(k) || this.readMethods.has(k) || (this.toolHandlers.has(tool) && !this.handlers.has(k)) ? LevelRead : LevelWrite;
   }
 
   // --- named tools (spec §8) ---
@@ -478,6 +483,33 @@ export class Node {
     const num = this.toolNumber(peer, name);
     if (num === undefined) return Promise.reject(new P2PACTError(ErrNoMethod, "the device has no tool " + name));
     return this.callOn(peer, stream, num, method, ...args);
+  }
+
+  /** handleToolAll serves every method of the named tool with h (the tool is registered at
+   * version 1 if it is not yet). The node only requires read on the tool; what each method needs
+   * is for h to check. Methods registered one by one with {@link handle} keep their own handlers.
+   * For a device that hosts another program's tool (spec §8.2). */
+  handleToolAll(name: string, h: ToolHandler) {
+    this.toolHandlers.set(this.registerTool(name, 1), h);
+  }
+
+  /** unregisterTool takes a named tool back: it leaves the hello (sent again to the devices in
+   * session) and its handlers are dropped. Registering the name again may give another number. */
+  unregisterTool(name: string) {
+    const num = this.names.get(name);
+    if (num === undefined) return;
+    this.names.delete(name);
+    this.numbers.delete(num);
+    this.versions.delete(num);
+    this.toolHandlers.delete(num);
+    for (const m of [this.handlers, this.levelHandlers]) for (const k of [...m.keys()]) if (Number(k.split(".")[0]) === num) m.delete(k);
+    for (const k of [...this.readMethods]) if (Number(k.split(".")[0]) === num) this.readMethods.delete(k);
+    this.reannounceTools();
+  }
+
+  /** peerTools lists the named tools a device announced in its hello, sorted by name. */
+  peerTools(peer: string): string[] {
+    return [...(this.peers.get(peer)?.named?.keys() ?? [])].sort();
   }
 
   /** namedMap is the hello's named map: {name: [tool, version]}. */
@@ -911,7 +943,9 @@ export class Node {
         forbidden = level < this.requiredLevel(tool as number, method as number);
       }
       const lh = this.levelHandlers.get(key);
+      const th = this.toolHandlers.get(tool as number);
       if (lh && !forbidden) h = (p, args) => lh(p, level, args);
+      else if (th && !h && !forbidden) h = (p, args) => th(p, level, method as number, args);
       const args = a.slice(4);
       const boot = ps.boot;
       const reply = async (res: CborValue[] | PromiseLike<CborValue[]>) => {
