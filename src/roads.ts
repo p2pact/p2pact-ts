@@ -103,19 +103,31 @@ export class UDPRoad implements Road {
 
 /** TCPRoad: a 2-byte length, then the packet. Connections on demand, used both ways. */
 export class TCPRoad implements Road {
-  readonly name = "tcp";
   stats: RoadStats = { sentBytes: 0, sentPackets: 0, recvBytes: 0, recvPackets: 0 };
-  private conns = new Map<string, net.Socket>();
-  private server?: net.Server;
+  protected conns = new Map<string, net.Socket>();
+  protected server?: net.Server;
 
-  private constructor(private recv: (pkt: Uint8Array, from: Endpoint) => void) {}
+  /** A stream road of another network (the local socket, local.ts) is the same with another name,
+   * dial and address of an accepted connection. */
+  protected constructor(protected recv: (pkt: Uint8Array, from: Endpoint) => void, readonly name: string = "tcp") {}
+
+  /** dial opens a connection to addr. */
+  protected dial(addr: string): net.Socket {
+    const [host, port] = splitHostPort(addr);
+    return net.connect({ host, port });
+  }
+
+  /** acceptAddr is the address under which an accepted connection is known. */
+  protected acceptAddr(c: net.Socket): string {
+    return joinHostPort(c.remoteAddress!, c.remotePort!);
+  }
 
   /** listen opens the road; addr "" — dial only. */
   static async listen(addr: string, recv: (pkt: Uint8Array, from: Endpoint) => void): Promise<TCPRoad> {
     const road = new TCPRoad(recv);
     if (!addr) return road;
     const [host, port] = splitHostPort(addr);
-    road.server = net.createServer((c) => road.serve(c, joinHostPort(c.remoteAddress!, c.remotePort!)));
+    road.server = net.createServer((c) => road.serve(c, road.acceptAddr(c)));
     await new Promise<void>((resolve, reject) => {
       road.server!.once("error", reject);
       road.server!.listen(port, host || undefined, () => resolve());
@@ -123,7 +135,7 @@ export class TCPRoad implements Road {
     return road;
   }
 
-  private serve(c: net.Socket, addr: string) {
+  protected serve(c: net.Socket, addr: string) {
     this.conns.get(addr)?.destroy();
     this.conns.set(addr, c);
     c.setNoDelay(true);
@@ -155,8 +167,7 @@ export class TCPRoad implements Road {
   send(addr: string, pkt: Uint8Array) {
     let c = this.conns.get(addr);
     if (!c) {
-      const [host, port] = splitHostPort(addr);
-      c = net.connect({ host, port });
+      c = this.dial(addr);
       this.serve(c, addr);
     }
     const frame = Buffer.alloc(2 + pkt.length);

@@ -8,6 +8,7 @@ import { Learner, learnTiming } from "./learn.js";
 import { cleanGrants, defaultGrants, grantLevel, grantsWire, isDefaultGrants, LevelRead, LevelWrite, parseGrants, type Grant } from "./grants.js";
 import { FirstNamedTool, fixedTools, validToolName, type ToolRef } from "./tools.js";
 import { CipherState, concat, Handshake } from "./noise.js";
+import { LocalRoad } from "./local.js";
 import { endpointKey, TCPRoad, UDPRoad, type Endpoint, type Road } from "./roads.js";
 import { allowed, hintsFromWire, hintsToWire, Identity, Invite, offered, Prologue, Trust, type Hints, type Peer } from "./store.js";
 
@@ -208,6 +209,10 @@ export class Node {
   private boot = u32(randomBytes(4), 0) || 1;
   private udp?: UDPRoad;
   private tcp?: TCPRoad;
+  private loc?: LocalRoad; // the local socket road (local.ts)
+  private localPath_ = ""; // the socket we listen on, or dial
+  // invites made for programs (pluginInvite) and the grants their install gave
+  private inviteGrants = new Map<string, Grant[]>();
   private sessions = new Map<number, Session>();
   private current = new Map<string, Session>();
   private hs = new Map<number, PendingHandshake>();
@@ -251,6 +256,34 @@ export class Node {
     this.tcp = await TCPRoad.listen(addr, (p, f) => this.receive(p, f));
   }
 
+  /** listenLocal opens the local socket at path (spec §3): a Unix domain socket readable and
+   * writable by our OS user only (mode 0600), on Windows a named pipe. An old socket file nobody
+   * listens on is replaced. */
+  async listenLocal(path: string) {
+    if (!path) throw new Error("no socket path");
+    if (this.loc) throw new Error("the local socket is already in use");
+    this.loc = await LocalRoad.open(path, (p, f) => this.receive(p, f));
+    this.localPath_ = path;
+  }
+
+  /** useLocal makes the node reach a device on this computer over its local socket at path: join
+   * and the session use it. The node does not listen. */
+  async useLocal(path: string) {
+    if (!path) throw new Error("no socket path");
+    if (this.loc) throw new Error("the local socket is already in use");
+    this.loc = await LocalRoad.open("", (p, f) => this.receive(p, f));
+    this.localPath_ = path;
+  }
+
+  /** localPath is the path of the local socket: the one we listen on, or the one we dial ("" — none). */
+  get localPath(): string {
+    return this.localPath_;
+  }
+
+  private isLocal(from: Endpoint): boolean {
+    return this.loc !== undefined && from.road === this.loc;
+  }
+
   get udpRoad() {
     return this.udp;
   }
@@ -270,6 +303,7 @@ export class Node {
     this.learner.close();
     this.udp?.close();
     this.tcp?.close();
+    this.loc?.close();
     for (const ps of this.peers.values()) for (const c of ps.calls.values()) c.reject(new Error("node closed"));
   }
 
@@ -278,6 +312,27 @@ export class Node {
    * handler that waits long returns {@link later}, so that the stream goes on without it. */
   handle(tool: number, method: number, h: Handler) {
     this.handlers.set(`${tool}.${method}`, h);
+  }
+
+  // --- programs on this computer (spec §2, §8.2) ---
+
+  /** pluginInvite makes the invite for a program the device starts: single use, no hints (the
+   * program reaches the device over the local socket), valid for ttlMs, and the program is
+   * granted exactly grants — the install gave them, nobody is asked. The program must pair with
+   * kind plugin over the local socket; it is never added to the family and never reached over
+   * another road. */
+  pluginInvite(ttlMs: number, grants: Grant[] = []): Invite {
+    const inv = new Invite(this.id.key.public, this.name, randomBytes(32), new Date(Date.now() + ttlMs), {});
+    this.invites.set(hex(inv.id), inv);
+    this.inviteGrants.set(hex(inv.id), cleanGrants(grants));
+    return inv;
+  }
+
+  /** pluginEnv is {@link pluginInvite} and the environment to start the program with
+   * (P2PACT_SOCKET and P2PACT_INVITE). The node must listen on its local socket. */
+  pluginEnv(ttlMs: number, grants: Grant[] = []): Record<string, string> {
+    if (!this.localPath_) throw new Error("the node does not listen on a local socket");
+    return { P2PACT_SOCKET: this.localPath_, P2PACT_INVITE: this.pluginInvite(ttlMs, grants).toString() };
   }
 
   // --- grants (spec §8.1) ---
@@ -453,6 +508,7 @@ export class Node {
     const eps: Endpoint[] = [];
     if (this.udp) for (const a of inv.hints.udp ?? []) eps.push({ road: this.udp, addr: a });
     if (this.tcp) for (const a of inv.hints.tcp ?? []) eps.push({ road: this.tcp, addr: a });
+    if (this.loc && this.localPath_) eps.push({ road: this.loc, addr: this.localPath_ }); // a device on this computer, over its socket
     if (eps.length === 0) throw new Error("the invite has no road we can use");
     const deadline = Date.now() + timeoutMs;
     let local = 0;
@@ -490,6 +546,7 @@ export class Node {
 
   /** befriend adds a device known from the family book, without pairing. */
   befriend(p: Peer) {
+    if (p.kind === KindPlugin) throw new Error("a plugin is never in the family");
     if (p.key.length !== 32 || address(p.key) !== p.addr) throw new Error("key does not match address");
     const old = this.trust.get(p.addr);
     if (old) {
@@ -652,7 +709,9 @@ export class Node {
     const payload = hs.readMessage(pkt.subarray(5));
     if (payload.length < 12) return;
     const peer = address(hs.rs!);
-    if (!this.trust.get(peer)) return; // silence to strangers
+    const known = this.trust.get(peer);
+    if (!known) return; // silence to strangers
+    if (known.kind === KindPlugin && !this.isLocal(from)) return; // a plugin is reachable over the local socket only (spec §2)
     const ps = this.peerState(peer)!;
     const ts = new DataView(payload.buffer, payload.byteOffset, 8).getBigUint64(0);
     const age = BigInt(now) * 1_000_000n - ts;
@@ -736,7 +795,7 @@ export class Node {
     hints.tcp ??= inv.hints.tcp;
     hints.relay ??= inv.hints.relay;
     const p: Peer = { addr: peer, key: inv.key, name: pp.name, pairSecret: inv.secret, hints, added: 0,
-      signKey: pp.signKey, os: pp.os, kind: pp.kind || undefined };
+      signKey: pp.signKey, os: pp.os, kind: pp.kind || undefined, local: this.isLocal(from) || undefined };
     this.trust.put(p);
     const s: Session = { peer, local, remote: u32(pkt, 5), send: c1, recv: c2, sendN: 0, win: new Window(), lastRecv: now };
     this.sessions.set(local, s);
@@ -756,20 +815,31 @@ export class Node {
     const payload = h.hs.readMessage(pkt.subarray(5));
     if (!h.hs.ciphers) return;
     const [c1, c2] = h.hs.ciphers;
-    this.hs.delete(local);
     const inv = h.invite!;
+    const pp = parsePair(payload);
+    const preset = this.inviteGrants.get(hex(inv.id));
+    const forProgram = preset !== undefined;
+    if ((pp.kind === KindPlugin || forProgram) && (pp.kind !== KindPlugin || !this.isLocal(from))) {
+      return; // a plugin pairs over the local socket only, with an invite made for programs (spec §2)
+    }
+    this.hs.delete(local);
     this.invites.delete(hex(inv.id)); // single use
+    this.inviteGrants.delete(hex(inv.id));
     const key = h.hs.rs!;
     const peer = address(key);
-    const pp = parsePair(payload);
     const p: Peer = { addr: peer, key: key.slice(), name: pp.name, pairSecret: inv.secret,
       hints: pp.hints, added: 0, signKey: pp.signKey, os: pp.os, kind: pp.kind || undefined, via: hex(inv.id) };
     // what the newcomer may use (spec §2): without wants it asks for everything and keeps the
     // default; with them, and no onWants to narrow them, it gets what it asked. With onWants
     // the application decides: until it does the newcomer may use nothing.
     if (pp.hasWants) p.grants = cleanGrants(pp.wants);
-    const on = this.onWants;
+    let on = this.onWants;
     if (on) p.grants = [];
+    if (forProgram) { // the install gave the grants: nobody is asked
+      on = undefined;
+      p.grants = cleanGrants(preset);
+    }
+    if (pp.kind === KindPlugin) p.hints = {}; // reachable over the local socket only
     this.trust.put(p);
     const s: Session = { peer, local, remote: h.remoteIdx!, send: c2, recv: c1, sendN: 0, win: new Window(), lastRecv: now };
     this.sessions.set(local, s);
@@ -981,7 +1051,7 @@ export class Node {
       if (mine.length) alive = mine;
     }
     if (alive.length > 0 && !all) {
-      const rank = (e: EpState) => ({ udp: 0, tcp: 1 } as Record<string, number>)[e.ep.road.name] ?? 2;
+      const rank = (e: EpState) => ({ udp: 0, tcp: 1, local: 1 } as Record<string, number>)[e.ep.road.name] ?? 2;
       // the road heard from last; a better kind only if heard within half a second of it
       let best = alive.reduce((b, e) => (e.lastRecv > b.lastRecv ? e : b));
       for (const e of alive) if (rank(e) < rank(best) && best.lastRecv - e.lastRecv < 500) best = e;
@@ -1000,6 +1070,8 @@ export class Node {
         if (!out.includes(e)) out.push(e);
       }
     };
+    if (p.local && this.loc && this.localPath_) add(this.loc, [this.localPath_]); // the device we dial on this computer
+    if (p.kind === KindPlugin) return out; // reachable over the local socket only, on the connection it opened
     add(this.udp, p.hints.udp);
     add(this.tcp, p.hints.tcp);
     return out;
