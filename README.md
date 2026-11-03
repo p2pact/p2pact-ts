@@ -46,6 +46,37 @@ await phone.call(peer.addr, 1, 2, 1, "run the tests");
 - Grants (spec §8.1): `setGrants` / `grant` / `revokeGrants` say what a trusted device may use (calls outside are error 4, events only with read); `markRead`, `handleLevel` mark read methods; `grantedBy` / `onGranted` tell what a device lets *you* use. `joinWants` asks at pairing, `onWants` lets the inviting application narrow or refuse.
 - Local programs (spec §2, §3): `listenLocal(path)` opens a Unix socket (mode 0600; a named pipe on Windows), `pluginEnv` gives a program it starts `P2PACT_SOCKET` and `P2PACT_INVITE`, and the program calls `newPlugin(dir, name)` to pair as a plugin. See [`examples/plugin-hello`](examples/plugin-hello).
 
+## Client SDK (`p2pact/client`)
+
+A typed client of the public tools for applications (the same as `p2pact-client` of
+[p2pact-kotlin](https://github.com/p2pact/p2pact-kotlin)): pair with a computer by its invite and use
+its chat (tool 1, ACP), fleet (tool 2) and plugins (tool 4).
+
+```ts
+import { P2pactClient } from "p2pact/client";
+
+const client = await P2pactClient.open("./app-data", "My app");
+const computer = await client.pair("p2pact1.…");        // asks for chat, fleet, plugins:read
+await computer.whenOnline();
+console.log(computer.grants);                            // what the person at the computer allowed
+
+const chat = computer.chat;
+const { sessions } = await chat.listSessions();
+chat.permissionHandler = (r) => r.allow();               // or ask the person; r.deny(), r.select(option)
+for await (const u of chat.updates) {                    // or chat.updates.subscribe(fn), .next()
+  if (u.type === "agent_message") process.stdout.write(u.text);
+}
+await chat.prompt(sessions[0].id, "run the tests");      // resolves when the turn ends
+
+await computer.fleet.watch();                            // computer.fleet.events
+await computer.plugins.list();
+```
+
+Calls reject with `ForbiddenError` (grants do not allow it, spec §8.1), `NoMethodError`,
+`NotFoundError`… (P2PACT error codes) or `RpcError` (the tool's own JSON-RPC errors). Every value
+keeps the JSON it was read from in `raw`. `P2pactClient.wrap(node)` puts the clients over a node you
+already run. See [`examples/client-cli`](examples/client-cli).
+
 ## Status
 
 Pairing, sessions, UDP and TCP roads, delivery with congestion control, messages,

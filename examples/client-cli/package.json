@@ -1,0 +1,11 @@
+{
+  "name": "client-cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A small command-line client of the P2PACT engine, on p2pact/client",
+  "bin": { "p2pact-cli": "cli.mjs" },
+  "dependencies": {
+    "p2pact": "file:../.."
+  }
+}
