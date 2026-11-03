@@ -5,10 +5,11 @@ import { compress, decompress, Dict, DictStore, dictId, has } from "./compress.j
 import { address, equal, hex, randomBytes } from "./crypto.js";
 import { dataHeader, keepalive, msgMax, Stream } from "./delivery.js";
 import { Learner, learnTiming } from "./learn.js";
+import { cleanGrants, grantLevel, grantsWire, isDefaultGrants, LevelRead, LevelWrite, parseGrants, type Grant } from "./grants.js";
 import { FirstNamedTool, fixedTools, validToolName, type ToolRef } from "./tools.js";
 import { CipherState, concat, Handshake } from "./noise.js";
 import { endpointKey, TCPRoad, UDPRoad, type Endpoint, type Road } from "./roads.js";
-import { hintsFromWire, hintsToWire, Identity, Invite, Prologue, Trust, type Hints, type Peer } from "./store.js";
+import { allowed, hintsFromWire, hintsToWire, Identity, Invite, offered, Prologue, Trust, type Hints, type Peer } from "./store.js";
 
 const pInit = 1, pResp = 2, pPair1 = 3, pPair2 = 4, pPair3 = 5, pData = 6, pReset = 7;
 const tsSkew = 120_000n * 1_000_000n; // ns
@@ -36,6 +37,11 @@ export class P2PACTError extends Error {
 /** Handler is a tool method: raw CBOR arguments → result values. Its call's turn on the stream
  * lasts until the returned promise settles; a handler that waits long returns {@link later}. */
 export type Handler = (peer: string, args: Uint8Array[]) => CborValue[] | Later | Promise<CborValue[] | Later>;
+
+/** LevelHandler is a tool method that checks the caller's level itself: the node only requires
+ * read, and passes the level (1 or 2) on. For a tool whose single method carries many (chat 1.1:
+ * one P2PACT method for all of ACP), where what a call needs depends on its arguments. */
+export type LevelHandler = (peer: string, level: number, args: Uint8Array[]) => CborValue[] | Later | Promise<CborValue[] | Later>;
 
 /** Later is a reply taken out of the stream's turn: see {@link later}. */
 export class Later {
@@ -172,6 +178,8 @@ export class Node {
    * awaited before the next one runs. */
   onEvent?: (peer: string, tool: number, event: number, args: Uint8Array[]) => void | Promise<void>;
   onPaired?: (p: Peer) => void;
+  /** onGranted is called when a known device tells what we may use of its tools (event 0.6). */
+  onGranted?: (peer: string, grants: Grant[]) => void;
   onHello?: (peer: string) => void;
   /** onHeld is called when messages from a device waited too long for a dictionary or its list
    * and were dropped (held — how many): the application can tell the user or resend. */
@@ -195,6 +203,9 @@ export class Node {
   private peers = new Map<string, PeerState>();
   private handlers = new Map<string, Handler>();
   // named tools: name → number and back, versions
+  // grants: methods that check the level themselves, methods marked read
+  private levelHandlers = new Map<string, LevelHandler>();
+  private readMethods = new Set<string>();
   private names = new Map<string, number>();
   private numbers = new Map<number, string>();
   private versions = new Map<number, number>();
@@ -216,6 +227,7 @@ export class Node {
     this.handle(0, 1, () => []);
     this.handle(0, 2, (peer) => this.info(peer));
     this.handle(0, 5, (peer, args) => this.dictHandler(peer, args));
+    this.handle(0, 6, (peer) => [grantsWire(this.grants(peer))]); // what the caller may use
   }
 
   async listenUDP(addr: string) {
@@ -256,6 +268,76 @@ export class Node {
     this.handlers.set(`${tool}.${method}`, h);
   }
 
+  // --- grants (spec §8.1) ---
+
+  /** handleLevel registers method tool.method like {@link handle}, for a handler that checks the
+   * level itself (see {@link LevelHandler}). */
+  handleLevel(tool: number, method: number, h: LevelHandler) {
+    this.levelHandlers.set(`${tool}.${method}`, h);
+  }
+
+  /** markRead declares methods of a tool as read (spec §8.1): a device with read on the tool may
+   * call them. The others are write. */
+  markRead(tool: number, ...methods: number[]) {
+    for (const m of methods) this.readMethods.add(`${tool}.${m}`);
+  }
+
+  /** grants is what we let a device use of ours (spec §8.1). */
+  grants(peer: string): Grant[] {
+    const p = this.trust.get(peer);
+    return p ? allowed(p) : [];
+  }
+
+  /** grantedBy is what a device lets us use of its tools, as it told us (event 0.6 or method
+   * 0.6); the default if it never did. */
+  grantedBy(peer: string): Grant[] {
+    const p = this.trust.get(peer);
+    return p ? offered(p) : [];
+  }
+
+  /** level is the level a device has on one of our tools, by name. */
+  level(peer: string, tool: string): number {
+    const p = this.trust.get(peer);
+    return p ? grantLevel(p.grants, tool) : 0;
+  }
+
+  /** setGrants replaces what a trusted device may use (an empty list revokes everything), keeps
+   * it with the trust and tells the device with event 0.6. */
+  setGrants(peer: string, grants: Grant[]) {
+    grants = cleanGrants(grants);
+    if (!this.trust.setGrants(peer, grants)) throw new Error("unknown device");
+    this.event(peer, 0, 6, grantsWire(grants));
+  }
+
+  /** grant changes one entry: the device gets level on the tool (LevelRead, LevelWrite); level 0
+   * removes the entry. */
+  grant(peer: string, tool: string, level: number) {
+    const p = this.trust.get(peer);
+    if (!p) throw new Error("unknown device");
+    const list = allowed(p).filter((g) => g.tool !== tool);
+    if (level > 0) list.push({ tool, level });
+    this.setGrants(peer, list);
+  }
+
+  /** revokeGrants takes everything away from a device but tool 0: it stays trusted and in session. */
+  revokeGrants(peer: string) {
+    this.setGrants(peer, []);
+  }
+
+  /** grantsEvent tells the device what it may use, unless that is the default it assumes. */
+  private grantsEvent(peer: string) {
+    const p = this.trust.get(peer);
+    const ps = this.peers.get(peer);
+    if (!p || !ps || isDefaultGrants(p.grants)) return;
+    this.push(ps, encode([3, 0, 6, grantsWire(p.grants!)]));
+  }
+
+  /** requiredLevel is the level a call needs. */
+  private requiredLevel(tool: number, method: number): number {
+    const k = `${tool}.${method}`;
+    return this.levelHandlers.has(k) || this.readMethods.has(k) ? LevelRead : LevelWrite;
+  }
+
   // --- named tools (spec §8) ---
 
   /** registerTool gives a tool of ours a name and picks its number: the first one from 64 up that
@@ -283,7 +365,7 @@ export class Node {
 
   private toolUsed(num: number): boolean {
     if (this.numbers.has(num)) return true;
-    for (const k of this.handlers.keys()) if (Number(k.split(".")[0]) === num) return true;
+    for (const k of [...this.handlers.keys(), ...this.levelHandlers.keys()]) if (Number(k.split(".")[0]) === num) return true;
     return false;
   }
 
@@ -447,6 +529,8 @@ export class Node {
   eventOn(peer: string, stream: number, tool: number, ev: number, ...args: unknown[]) {
     const ps = this.peerState(peer);
     if (!ps) throw new Error("unknown device");
+    // a tool's events go only to devices with at least read on it (spec §8.1)
+    if (tool !== 0 && grantLevel(this.trust.get(peer)?.grants, this.toolName(tool)) < LevelRead) return;
     this.push(ps, encode([3, tool, ev, ...args]), stream, tool !== 0);
   }
 
@@ -461,7 +545,8 @@ export class Node {
   /** info is the hello (spec §6, 0.2); the dictionaries are those peer may see. */
   private info(peer: string): CborValue[] {
     const tools = new Map<CborValue, CborValue>();
-    for (const k of this.handlers.keys()) {
+    // tools whose handlers check the caller's level are tools too
+    for (const k of [...this.handlers.keys(), ...this.levelHandlers.keys()]) {
       const t = Number(k.split(".")[0]);
       if (t !== 0 && !this.numbers.has(t)) tools.set(t, 1);
     }
@@ -680,6 +765,7 @@ export class Node {
   private sendInfo(peer: string) {
     this.hintsSent = encode(hintsToWire(this.hints())); // what the devices know of us (reannounce)
     this.push(this.peerState(peer)!, encode([3, 0, 2, ...this.info(peer)]));
+    this.grantsEvent(peer);
   }
 
   private message(peer: string, msg: Uint8Array, stream = 0) {
@@ -699,7 +785,15 @@ export class Node {
       const tool = decode(a[2]);
       if (tool !== 0) this.hear(peer, msg);
       const method = decode(a[3]);
-      const h = this.handlers.get(`${tool}.${method}`);
+      const key = `${tool}.${method}`;
+      let h: Handler | undefined = this.handlers.get(key);
+      let level = 0, forbidden = false;
+      if (tool !== 0) { // grants (spec §8.1): tool 0 is always allowed
+        level = grantLevel(this.trust.get(peer)?.grants, this.toolName(tool as number));
+        forbidden = level < this.requiredLevel(tool as number, method as number);
+      }
+      const lh = this.levelHandlers.get(key);
+      if (lh && !forbidden) h = (p, args) => lh(p, level, args);
       const args = a.slice(4);
       const boot = ps.boot;
       const reply = async (res: CborValue[] | PromiseLike<CborValue[]>) => {
@@ -719,6 +813,7 @@ export class Node {
         } else this.push(ps2, encode(out), stream, tool !== 0, true);
       };
       const run = async () => {
+        if (forbidden) return reply(Promise.reject(new P2PACTError(ErrForbidden, "forbidden")));
         if (!h) return reply(Promise.reject(new P2PACTError(ErrNoMethod, "no such method")));
         let res: CborValue[] | Later;
         try {
@@ -756,6 +851,14 @@ export class Node {
         this.fetchNew(peer, ps);
         this.drain(peer, ps);
         if (this.onHello) queueMicrotask(() => this.onHello!(peer));
+        return;
+      }
+      if (tool === 0 && ev === 6 && a.length >= 4) { // what we may use of its tools
+        const g = parseGrants(decode(a[3]));
+        if (g) {
+          this.trust.setGranted(peer, g);
+          if (this.onGranted) queueMicrotask(() => this.onGranted!(peer, g));
+        }
         return;
       }
       if (tool === 0 && ev === 5 && a.length >= 4) {
