@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { LevelRead, LevelWrite, type Grant } from "../src/index.js";
-import { DEFAULT_WANTS, ForbiddenError, NoMethodError, Tools } from "../src/client/index.js";
+import { eventually } from "./util.js";
+import { DEFAULT_WANTS, type PluginsChanged, ForbiddenError, NoMethodError, Tools } from "../src/client/index.js";
 import { Fixtures, Harness } from "./client-util.js";
 
 const wants: Grant[] = [...DEFAULT_WANTS, { tool: "com.example.hello", level: LevelWrite }];
@@ -56,4 +57,30 @@ test("calls a plugin's tool by name", () => run(async (h) => {
 test("a tool without a grant is forbidden", () => run(async (h) => {
   const computer = await h.connect(); // no grant on the hosted tool
   await assert.rejects(computer.callTool("com.example.hello", 1, "x"), ForbiddenError);
+}));
+
+test("plugins: grants level as a string or a number", () => run(async (h) => {
+  const plugins = (await h.connect(wants)).plugins;
+  h.engine.overrides.set("4:plugins/grants", () => ({ jsonrpc: "2.0", result: { name: "x", grants: [
+    { tool: "a", level: "read" }, { tool: "b", level: "write" }, { tool: "c", level: 2 }, { tool: "d", level: 1 }, { tool: "e", level: "bogus" }], read: {} } }));
+  assert.deepEqual((await plugins.grants("x")).grants, [
+    { tool: "a", level: LevelRead }, { tool: "b", level: LevelWrite }, { tool: "c", level: LevelWrite }, { tool: "d", level: LevelRead }]);
+}));
+
+test("plugins: watch, changed events, unwatch", () => run(async (h) => {
+  const plugins = (await h.connect(wants)).plugins;
+  const events: PluginsChanged[] = [];
+  plugins.events.subscribe((e) => events.push(e));
+  const list = await plugins.watch();
+  assert.equal(list[0].name, "com.example.hello");
+  assert.ok(h.sent(4, "plugins/watch"));
+  h.engine.notify(4, Fixtures.read("p2pact.plugins", "plugins.changed.notification"));
+  h.engine.notify(4, Fixtures.read("p2pact.plugins", "plugins.changed.removed.notification"));
+  await eventually("two events", () => events.length === 2);
+  assert.equal(events[0].plugin.name, "com.example.hello");
+  assert.equal(events[0].plugin.status, "running");
+  assert.equal(events[0].removed, false);
+  assert.equal(events[1].removed, true);
+  await plugins.unwatch();
+  assert.ok(h.engine.seen.some((s) => s.method === "plugins/unwatch"));
 }));

@@ -26,7 +26,7 @@ export interface Seen {
 const CHAT_READ = new Set(["initialize", "session/list", "session/load", "_p2pact/older", "_p2pact/commands", "_p2pact/files",
   "_p2pact/history", "_p2pact/projects", "_p2pact/agents", "_p2pact/image", "_p2pact/diff"]);
 const FLEET_READ = new Set(["fleet/hello", "node/get", "session/list", "session/get", "session/messages", "fleet/watch", "fleet/unwatch"]);
-const PLUGINS_READ = new Set(["plugins/list", "plugins/log", "plugins/grants"]);
+const PLUGINS_READ = new Set(["plugins/list", "plugins/log", "plugins/grants", "plugins/watch", "plugins/unwatch"]);
 
 /** FakeEngine is a computer built from the library alone: it serves tools 1, 2 and 4 and a hosted
  * tool, and answers with the messages of the contract fixtures. What a client sent is in `seen`. */

@@ -5,7 +5,7 @@ export type { ClientConfig, ComputerEvent, ConnectionState, ToolEvent } from "./
 export { ChatClient } from "./chat.js";
 export { FleetClient } from "./fleet.js";
 export { PluginsClient } from "./plugins.js";
-export type { PluginGrants, PluginInfo, PluginStatus } from "./plugins.js";
+export type { PluginGrants, PluginInfo, PluginsChanged, PluginStatus } from "./plugins.js";
 export * from "./errors.js";
 export * from "./chat-models.js";
 export * from "./fleet-models.js";

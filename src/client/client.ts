@@ -195,7 +195,9 @@ export class P2pactClient {
     }
     if (tool === Tools.CHAT_NUMBER && ev === 1) c.chat.notified(args);
     else if (tool === Tools.FLEET_NUMBER && ev === 1) c.fleet.notified(args);
-    else if (tool === Tools.PLUGINS_NUMBER) return;
+    else if (tool === Tools.PLUGINS_NUMBER) {
+      if (ev === 1) c.plugins.notified(args);
+    }
     else this.toolEvents.emit({ computer: c, tool: this.node.peerToolName(addr, tool), toolNumber: tool, event: ev, args });
   }
 
@@ -299,6 +301,7 @@ export class Computer {
     this.owner.resetEventNumbers(this.id);
     this.chat.reconnected();
     this.fleet.reconnected();
+    this.plugins_?.reconnected();
     this.ready.resolve(this);
     this.owner.computerEvents.emit({ type: "online", computer: this });
   }

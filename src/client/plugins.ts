@@ -1,10 +1,10 @@
 // Tool 4 `p2pact.plugins` (plugins spec): the plugins a computer hosts. JSON-RPC over `4.1 rpc`.
 // Install and remove stay on the computer.
 import type { CborValue } from "../cbor.js";
-import type { Grant } from "../grants.js";
+import { LevelRead, LevelWrite, type Grant } from "../grants.js";
 import type { Computer } from "./client.js";
 import { Tools } from "./names.js";
-import { asList, asMap, bool, num, obj, objs, str, strings, wire, type JsonMap } from "./support.js";
+import { asList, asMap, bool, Events, normalize, num, obj, objs, str, strings, wire, type JsonMap } from "./support.js";
 
 export type PluginStatus = "running" | "starting" | "restarting" | "stopped" | "failed" | "unsupported" | "broken" | "unknown";
 // stopped — switched off; failed — disabled after repeated exits; unsupported — not for this system; broken — unreadable manifest
@@ -46,7 +46,25 @@ export interface PluginGrants {
   raw: JsonMap;
 }
 
+/** An event of the watch: a plugin changed (`plugins/changed`); `removed` — it was removed. */
+export interface PluginsChanged {
+  plugin: PluginInfo;
+  removed: boolean;
+}
+
+/** The level of a grant as the engine sends it ("read" or "write"); a number is taken too. */
+function parseLevel(v: unknown): number | undefined {
+  if (v === "read") return LevelRead;
+  if (v === "write") return LevelWrite;
+  return typeof v === "number" ? v : undefined;
+}
+
 export class PluginsClient {
+  /** The `plugins/changed` events of this computer (after `watch`); also after the computer restarted. */
+  readonly events = new Events<PluginsChanged>();
+
+  private watching = false;
+
   /** @internal */
   constructor(private readonly computer: Computer) {}
 
@@ -70,12 +88,38 @@ export class PluginsClient {
     const grants: Grant[] = [];
     for (const g of asList(r.grants) ?? []) {
       const m = asMap(g);
-      const tool = m && str(m, "tool"), level = m && num(m, "level");
+      const tool = m && str(m, "tool"), level = m && parseLevel(m.level);
       if (tool !== undefined && level !== undefined) grants.push({ tool, level });
     }
     const read: Record<string, number[]> = {};
     for (const [k, v] of Object.entries(obj(r, "read") ?? {})) read[k] = (asList(v) ?? []).filter((x): x is number => typeof x === "number");
     return { name: str(r, "name") ?? name, grants, read, raw: r };
+  }
+
+  /** watch subscribes to `plugins/changed` (`events`) and gives the plugins as they are now. Read. */
+  async watch(): Promise<PluginInfo[]> {
+    this.watching = true;
+    return objs(await this.call("plugins/watch"), "plugins").map(parsePlugin);
+  }
+
+  /** unwatch ends the subscription. */
+  async unwatch(): Promise<void> {
+    this.watching = false;
+    await this.call("plugins/unwatch");
+  }
+
+  /** @internal */
+  reconnected() {
+    // the device forgot the subscription with its restart (plugins spec §2)
+    if (this.watching) this.call("plugins/watch").catch(() => {});
+  }
+
+  /** @internal */
+  notified(args: CborValue[]) {
+    const msg = asMap(normalize(args[0]));
+    if (!msg || str(msg, "method") !== "plugins/changed") return;
+    const p = obj(msg, "params") ?? {};
+    this.events.emit({ plugin: parsePlugin(p), removed: bool(p, "removed") ?? false });
   }
 
   /** enable starts a plugin (and keeps it on across the computer's restarts). Needs write. */
