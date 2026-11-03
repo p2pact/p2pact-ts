@@ -71,6 +71,8 @@ test("an app against the engine", { skip, timeout: 240_000 }, async () => {
     const computer = await client.pair(await engine.waitFile("invite"), wants, 60_000);
     await computer.whenOnline();
     assert.equal(await engine.waitFile("decision"), "approved");
+    // the decision is the person's; the grants reach the app by event 0.6 a moment later
+    await eventually("write level on the chat", () => computer.level(Tools.CHAT) === LevelWrite);
 
     const chat = computer.chat;
     assert.ok((await chat.initialize()).loadSession);
