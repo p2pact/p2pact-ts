@@ -13,6 +13,7 @@ import { CipherState, concat, Handshake } from "./noise.js";
 import { endpointKey, type AddrRoad, type Endpoint, type Road } from "./roads.js";
 import { WsRelayRoad, type WebSocketCtor } from "./relay-ws.js";
 import type { Storage } from "./storage.js";
+import { addrBytes, addrText, DefaultForwardRate, evForward, evForwarded, forwardBurst, forwardQueue, forwardStream, FwdBucket, isVia, ViaRoad, type FwdPending } from "./forward.js";
 import { allowed, hintsFromWire, hintsToWire, Identity, Invite, offered, Prologue, relayChannel, Trust, type Hints, type Peer } from "./store.js";
 
 const pInit = 1, pResp = 2, pPair1 = 3, pPair2 = 4, pPair3 = 5, pData = 6, pReset = 7;
@@ -23,6 +24,10 @@ const aliveFor = 60_000;
 const keepaliveGap = 25_000;
 const sessionIdle = 180_000;
 const prologue = new TextEncoder().encode(Prologue);
+
+/** probeTiming: how often the direct roads are tried while a session runs over a relay, an
+ * application road or a road via a third device (spec §7). Tests shorten it. */
+export const probeTiming = { every: 30_000 };
 
 /** holdTiming: held messages (spec §5) wait for the sender's dictionary or its list. That must not
  * last: after ask we ask again (its hello, the dictionary); after drop the held messages are
@@ -132,6 +137,8 @@ interface PeerState {
   named?: Map<string, ToolRef>; // its named tools, from its hello (spec §8)
   sysCalls: Set<number>; // our calls of tool 0: their results are not conversation
   inbox: Map<StreamId, (() => Promise<void> | void)[]>; // calls and events waiting for their turn, per stream
+  forwards: string[]; // the devices it forwards to for us, from its hello (spec §3)
+  lastProbe: number; // when we last tried its direct roads (probe)
 }
 
 /** Kinds of device (spec §1): what a device is for, told in the pairing payload and the hello. */
@@ -236,6 +243,17 @@ export class Node {
   noLearning = false;
   /** kind is what this device is for (KindComputer…), told in pairing and the hello (spec §1). */
   kind = KindUnknown;
+  /** forwardRate is how many bytes a second we forward in one direction of a pair we forward
+   * for (allowForward); 0 — DefaultForwardRate. */
+  forwardRate = 0;
+
+  private vias = new Map<string, ViaRoad>(); // roads through forwarders, by forwarder
+  private fwdBuckets = new Map<string, FwdBucket>(); // rate limit per forwarded direction ("from>to")
+  /** @internal tests: what we forward */
+  forwardTap?: (from: string, to: string, pkt: Uint8Array) => void;
+  private fwdCount = 0;
+  private fwdDropped = 0;
+  private advertise?: Hints; // addresses announced instead of our own (setAdvertise)
 
   private boot = u32(randomBytes(4), 0) || 1;
   private udp?: AddrRoad;
@@ -646,7 +664,9 @@ export class Node {
       this.current.delete(addr);
       this.sessions.delete(s.local);
     }
+    const fw = gone?.forward ?? []; // the devices we forwarded to it for: they learn it is withdrawn
     this.trust.remove(addr);
+    for (const a of fw) this.hello(a);
   }
 
   // --- calls and events ---
@@ -708,10 +728,26 @@ export class Node {
       const t = Number(k.split(".")[0]);
       if (t !== 0 && !this.numbers.has(t)) tools.set(t, 1);
     }
-    return [this.name, goos(), "p2pact-ts", tools, this.dicts.ids(peer), hintsToWire(this.hints()), this.kind, this.namedMap()];
+    const info: CborValue[] = [this.name, goos(), "p2pact-ts", tools, this.dicts.ids(peer), hintsToWire(this.hints()), this.kind, this.namedMap()];
+    const fw = this.forwardsWire(peer); // whom we forward to for it (spec §3)
+    if (fw.length) info.push(fw);
+    return info;
+  }
+
+  /** setAdvertise announces these addresses instead of our own in invites and hellos (behind a
+   * NAT with a forwarded port, say); an empty one announces none — known devices reach us only
+   * over roads they already have, or through a forwarder. undefined — our own again. The relay
+   * of setRelay is still announced unless h names one. */
+  setAdvertise(h?: Hints) {
+    this.advertise = h ? { ...h } : undefined;
   }
 
   private hints(): Hints {
+    if (this.advertise) {
+      const h: Hints = { ...this.advertise };
+      if (!h.ws?.length && this.ownWs.length) h.ws = [...this.ownWs];
+      return h;
+    }
     const h: Hints = {};
     const udp = this.udp?.localAddrs();
     if (udp?.length) h.udp = udp;
@@ -719,6 +755,210 @@ export class Node {
     if (tcp?.length) h.tcp = tcp;
     if (this.ownWs.length) h.ws = [...this.ownWs];
     return h;
+  }
+
+  // --- via a third device (spec §3, forward.ts) ---
+
+  /** allowForward opts this device in (on) or out as a forwarder between two devices it trusts:
+   * one consent for both directions, kept with the trusted list. Both devices learn it from our
+   * hello, sent again to them at once. */
+  allowForward(a: string, b: string, on: boolean) {
+    if (a === b || a === this.id.addr || b === this.id.addr) throw new Error("forwarding needs two other devices");
+    const pa = this.trust.get(a), pb = this.trust.get(b);
+    if (!pa || !pb) throw new Error("unknown device");
+    if (pa.kind === KindPlugin || pb.kind === KindPlugin) throw new Error("a plugin is reachable over the local socket only");
+    const set = (p: Peer, other: string): boolean => {
+      const old = p.forward ?? [];
+      const list = old.filter((s) => s !== other);
+      if (on) list.push(other);
+      list.sort();
+      if (list.length === old.length && list.every((s, i) => s === old[i])) return false;
+      this.trust.setForward(p.addr, list);
+      return true;
+    };
+    if (set(pa, b)) this.hello(a);
+    if (set(pb, a)) this.hello(b);
+  }
+
+  /** forwards lists the devices we forward to for a known device (allowForward). */
+  forwards(peer: string): string[] {
+    const p = this.trust.get(peer);
+    if (!p) return [];
+    return (p.forward ?? []).filter((a) => a !== peer && this.trust.get(a));
+  }
+
+  /** forwarders lists the devices that forward for us to peer: their hellos list it. */
+  forwarders(peer: string): string[] {
+    const out: string[] = [];
+    for (const [x, xs] of this.peers) if (x !== peer && xs.forwards.includes(peer)) out.push(x);
+    return out.sort();
+  }
+
+  /** forwardStats: packets this device forwarded for others, and those it dropped. */
+  forwardStats(): { forwarded: number; dropped: number } {
+    return { forwarded: this.fwdCount, dropped: this.fwdDropped };
+  }
+
+  /** hello sends our hello again to a device in session (what we forward for it changed). */
+  private hello(peer: string) {
+    if (!this.current.has(peer)) return;
+    const ps = this.peerState(peer);
+    if (ps) this.push(ps, encode([3, 0, 2, ...this.info(peer)]));
+  }
+
+  /** forwardsWire is the hello's ninth element: what we forward to for peer. */
+  private forwardsWire(peer: string): Uint8Array[] {
+    const out: Uint8Array[] = [];
+    for (const a of this.forwards(peer)) {
+      const b = addrBytes(a);
+      if (b) out.push(b);
+    }
+    return out;
+  }
+
+  /** via is the road through forwarder x. */
+  private via(x: string): ViaRoad {
+    let v = this.vias.get(x);
+    if (!v) {
+      v = new ViaRoad(x, (fx, to, pkt) => this.viaSend(fx, to, pkt));
+      this.vias.set(x, v);
+    }
+    return v;
+  }
+
+  /** viaSend wraps a packet for another device into event 0.7 to forwarder x. What cannot go is
+   * dropped: the session resends it, or another road carries it. */
+  private viaSend(x: string, to: string, pkt: Uint8Array) {
+    const raw = addrBytes(to);
+    const ps = this.peers.get(x);
+    if (pkt.length > MaxRoadPacketSize || !raw || !ps || !this.direct(ps, Date.now())) return;
+    if (ps.st.queue.length >= forwardQueue) return; // our own traffic to x goes first
+    ps.st.push(encode([3, 0, evForward, raw, pkt]), false, forwardStream(raw), false);
+    this.wake();
+  }
+
+  /** direct: we are in session with the device and have a live road to it that is not via a
+   * third device. Forwarding takes one hop only — no chains, no loops. */
+  private direct(ps: PeerState, now: number): boolean {
+    if (!this.current.has(ps.addr)) return false;
+    for (const e of ps.eps.values()) if (!isVia(e.ep.road) && now - e.lastRecv <= aliveFor) return true;
+    return false;
+  }
+
+  /** heardForwards takes the list a device's hello gave: the devices it forwards to for us. A
+   * device newly reachable through it gets a handshake at once. */
+  private heardForwards(x: string, ps: PeerState, v: CborValue) {
+    const old = ps.forwards;
+    ps.forwards = [];
+    for (const b of idsOf(v)) {
+      if (b.length !== 16) continue;
+      const a = addrText(b);
+      if (a !== x && a !== this.id.addr && !ps.forwards.includes(a)) ps.forwards.push(a); // trust is checked on use
+    }
+    const now = Date.now();
+    for (const a of ps.forwards) {
+      if (old.includes(a) || this.current.has(a)) continue;
+      const pa = this.peerState(a);
+      if (!pa) continue;
+      pa.lastInit = 0;
+      const first = pa.st.idle() ? null : pa.st.nextPacket(now, false)?.plain ?? null;
+      this.startInit(now, a, pa, first);
+    }
+  }
+
+  /** forwardIn: device from asks us to carry a packet to another device (event 0.7). Anything we
+   * may not or cannot forward is dropped silently. */
+  private forwardIn(from: string, args: Uint8Array[]) {
+    let to: CborValue = null, pkt: CborValue = null;
+    try {
+      if (args.length >= 2) [to, pkt] = [decode(args[0]), decode(args[1])];
+    } catch {
+      /* dropped below */
+    }
+    if (!(to instanceof Uint8Array) || !(pkt instanceof Uint8Array) || to.length !== 16 || pkt.length < 5 || pkt.length > MaxRoadPacketSize) {
+      this.fwdDropped++;
+      return;
+    }
+    const now = Date.now();
+    const dest = addrText(to);
+    const pf = this.trust.get(from);
+    if (dest === from || dest === this.id.addr || !pf || !this.trust.get(dest) || !pf.forward?.includes(dest)) {
+      this.fwdDropped++;
+      return;
+    }
+    const pd = this.peerState(dest), ps = this.peers.get(from);
+    if (!ps || !pd || !this.direct(ps, now) || !this.direct(pd, now) || pd.st.queue.length >= forwardQueue) {
+      this.fwdDropped++;
+      return;
+    }
+    const src = addrBytes(from)!;
+    const msg = encode([3, 0, evForwarded, src, pkt]);
+    if (!this.fwdOffer(from + ">" + dest, { to: dest, msg, stream: forwardStream(src), size: pkt.length }, now)) {
+      this.fwdDropped++;
+      return;
+    }
+    this.forwardTap?.(from, dest, pkt);
+  }
+
+  /** @internal fwdOffer forwards p now, or queues it behind its direction's rate; false — dropped. */
+  fwdOffer(dir: string, p: FwdPending, now: number): boolean {
+    let b = this.fwdBuckets.get(dir);
+    if (!b) {
+      b = new FwdBucket(forwardBurst, now);
+      this.fwdBuckets.set(dir, b);
+    }
+    b.refill(this.forwardRate > 0 ? this.forwardRate : DefaultForwardRate, now);
+    if (b.q.length === 0 && b.tokens >= p.size) {
+      b.tokens -= p.size;
+      this.fwdSend(p);
+      return true;
+    }
+    if (b.queued + p.size > forwardBurst) return false;
+    b.q.push(p);
+    b.queued += p.size;
+    return true;
+  }
+
+  /** @internal fwdRelease forwards what waited for its direction's rate (called with every pump). */
+  fwdRelease(now: number) {
+    for (const [dir, b] of this.fwdBuckets) {
+      if (b.q.length === 0) {
+        if (now - b.at > 60_000) this.fwdBuckets.delete(dir); // full again long ago
+        continue;
+      }
+      b.refill(this.forwardRate > 0 ? this.forwardRate : DefaultForwardRate, now);
+      while (b.q.length > 0 && b.tokens >= b.q[0].size) {
+        const p = b.q.shift()!;
+        b.queued -= p.size;
+        b.tokens -= p.size;
+        this.fwdSend(p);
+      }
+    }
+  }
+
+  private fwdSend(p: FwdPending) {
+    const pd = this.peers.get(p.to);
+    if (!pd) return;
+    pd.st.push(p.msg, false, p.stream, false);
+    this.fwdCount++;
+    this.wake();
+  }
+
+  /** forwardedIn: forwarder x hands over a packet another device sent us through it (event 0.8).
+   * It is handled as arriving on the road via x — only from a device x told us it forwards to,
+   * and only over a road to x that is not via a third device. */
+  private forwardedIn(x: string, args: Uint8Array[]) {
+    let src: CborValue = null, pkt: CborValue = null;
+    try {
+      if (args.length >= 2) [src, pkt] = [decode(args[0]), decode(args[1])];
+    } catch {
+      return;
+    }
+    if (!(src instanceof Uint8Array) || !(pkt instanceof Uint8Array) || src.length !== 16 || pkt.length < 5 || pkt.length > MaxRoadPacketSize) return;
+    const from = addrText(src);
+    const xs = this.peers.get(x);
+    if (from === x || from === this.id.addr || !xs || !xs.forwards.includes(from) || !this.trust.get(from) || !this.direct(xs, Date.now())) return;
+    this.receive(pkt.slice(), { road: this.via(x), addr: from });
   }
 
   // --- receiving ---
@@ -780,7 +1020,12 @@ export class Node {
     if (!this.current.has(s.peer)) this.current.set(s.peer, s);
     const ps = this.peerState(s.peer)!;
     ps.heard = true;
+    // a packet on a better road than the one in use (a probe, spec §7) is answered on it: the
+    // other side hears the road too, and both move to it
+    const c = this.candidates(s.peer, ps, now, false);
+    const better = c.length === 1 && (from.road.rank ?? 2) < (c[0].ep.road.rank ?? 2);
     this.seen(ps, from, now, s.local);
+    if (better) this.sealTo(s, ps.eps.get(endpointKey(from))!, now, keepalive());
     ps.st.receive(now, plain, (m, z, st) => this.inbound(s.peer, m, z, st));
     if (ps.st.ackDue !== 0 && now >= ps.st.ackDue) this.wake();
   }
@@ -1056,9 +1301,18 @@ export class Node {
         ps.dicts = idsOf(decode(a[7]));
         ps.lacks = [];
         ps.tried = [];
+        this.heardForwards(peer, ps, a.length >= 12 ? decode(a[11]) : null);
         this.fetchNew(peer, ps);
         this.drain(peer, ps);
         if (this.onHello) queueMicrotask(() => this.onHello!(peer));
+        return;
+      }
+      if (tool === 0 && ev === evForward) { // carry a packet to another device (spec §3)
+        this.forwardIn(peer, a.slice(3));
+        return;
+      }
+      if (tool === 0 && ev === evForwarded) { // a packet another device sent us through this one
+        this.forwardedIn(peer, a.slice(3));
         return;
       }
       if (tool === 0 && ev === 6 && a.length >= 4) { // what we may use of its tools
@@ -1116,7 +1370,8 @@ export class Node {
     if (!ps) {
       if (!this.trust.get(peer)) return undefined;
       ps = { addr: peer, st: new Stream(), eps: new Map(), lastTS: 0n, boot: 0, heard: false, lastInit: 0, calls: new Map(), callID: 0, dicts: [],
-        lacks: [], waiting: [], waitSince: 0, fetching: false, askingInfo: false, askedInfo: 0, tried: [], sysCalls: new Set(), inbox: new Map() };
+        lacks: [], waiting: [], waitSince: 0, fetching: false, askingInfo: false, askedInfo: 0, tried: [], sysCalls: new Set(), inbox: new Map(),
+        forwards: [], lastProbe: 0 };
       this.peers.set(peer, ps);
     }
     return ps;
@@ -1147,6 +1402,9 @@ export class Node {
       for (const e of alive) if (rank(e) < rank(best) && best.lastRecv - e.lastRecv < 500) best = e;
       return [best];
     }
+    // a road via a third device takes retransmissions only while no other road is live: every
+    // packet on it costs the forwarder (spec §7)
+    const other = alive.some((e) => !isVia(e.ep.road));
     const out = alive;
     const p = this.trust.get(peer);
     if (!p) return out;
@@ -1167,7 +1425,10 @@ export class Node {
     const relay = this.pairRelay(p);
     if (relay) add(relay, [relayChannel(p)]);
     for (const a of this.apps) if (a.peer === p.addr) add(a, [a.id]); // a link the application opened to this device
-    return out;
+    for (const [x, xs] of this.peers) { // devices that forward to it for us (spec §3)
+      if (x !== peer && this.current.has(x) && xs.forwards.includes(peer)) add(this.via(x), [peer]);
+    }
+    return other ? out.filter((e) => !isVia(e.ep.road)) : out;
   }
 
   private sendData(now: number, peer: string, ps: PeerState, s: Session, plain: Uint8Array, all: boolean) {
@@ -1211,6 +1472,7 @@ export class Node {
 
   private pump() {
     const now = Date.now();
+    this.fwdRelease(now);
     for (const [peer, ps] of this.peers) {
       const s = this.current.get(peer);
       if (!s) {
@@ -1236,13 +1498,7 @@ export class Node {
         this.sendData(now, peer, ps, s, next.plain, next.retry);
       }
       for (const e of ps.eps.values()) {
-        if (now - e.lastRecv <= aliveFor && now - e.lastSend >= keepaliveGap) {
-          const hdr = concat(Uint8Array.of(pData), be32(s.remote), be32(s.sendN));
-          const pkt = concat(hdr, s.send.encryptAt(BigInt(s.sendN), hdr, keepalive()));
-          s.sendN++;
-          e.ep.road.send(e.ep.addr, pkt);
-          e.lastSend = now;
-        }
+        if (now - e.lastRecv <= aliveFor && now - e.lastSend >= keepaliveGap) this.sealTo(s, e, now, keepalive());
       }
     }
   }
@@ -1252,6 +1508,8 @@ export class Node {
     for (const p of this.trust.list()) {
       const ps = this.peerState(p.addr);
       if (ps && !this.current.has(p.addr) && now - ps.lastInit >= autoConnect) this.startInit(now, p.addr, ps, null);
+      const s = this.current.get(p.addr);
+      if (ps && s) this.probe(now, p.addr, ps, s);
     }
     for (const [idx, s] of this.sessions) if (this.current.get(s.peer) !== s && now - s.lastRecv > sessionIdle) this.sessions.delete(idx);
     for (const [idx, h] of this.hs) if (now - h.at > 60_000) this.hs.delete(idx);
@@ -1293,6 +1551,29 @@ export class Node {
     const cur = encode(hintsToWire(this.hints()));
     if (!this.hintsSent || equal(cur, this.hintsSent)) return; // nothing announced yet, or the same
     for (const peer of this.current.keys()) this.sendInfo(peer);
+  }
+
+  /** probe tries the direct roads to a device while the session runs over a relay, an
+   * application road or a road via a third device (spec §7): a keepalive to every UDP and TCP
+   * address known for it, every probeTiming.every. The one that answers is live, and being
+   * better it takes over. */
+  private probe(now: number, peer: string, ps: PeerState, s: Session) {
+    if (now - ps.lastProbe < probeTiming.every) return;
+    const c = this.candidates(peer, ps, now, false);
+    if (c.length !== 1 || (c[0].ep.road.rank ?? 2) < 2) return;
+    ps.lastProbe = now;
+    for (const e of this.candidates(peer, ps, now, true)) {
+      if ((e.ep.road.rank ?? 2) < 2) this.sealTo(s, e, now, keepalive());
+    }
+  }
+
+  /** sealTo sends session content on one endpoint only (a keepalive, a probe). */
+  private sealTo(s: Session, e: EpState, now: number, plain: Uint8Array) {
+    const hdr = concat(Uint8Array.of(pData), be32(s.remote), be32(s.sendN));
+    const pkt = concat(hdr, s.send.encryptAt(BigInt(s.sendN), hdr, plain));
+    s.sendN++;
+    e.ep.road.send(e.ep.addr, pkt);
+    e.lastSend = now;
   }
 
   private newIndex(): number {
@@ -1621,7 +1902,12 @@ function idsOf(v: CborValue): Uint8Array[] {
 /** outOfOrder: results/errors of our calls, hellos and dictionary lists may skip the queue. */
 function outOfOrder(m: Uint8Array): boolean {
   if (m.length < 2) return false;
-  return m[1] === 1 || m[1] === 2 || bootstrap(m);
+  return m[1] === 1 || m[1] === 2 || bootstrap(m) || forwardMsg(m);
+}
+
+/** forwardMsg reports events 0.7 and 0.8: never compressed, run out of order (spec §3). */
+function forwardMsg(m: Uint8Array): boolean {
+  return m.length > 3 && m[1] === 3 && m[2] === 0 && (m[3] === evForward || m[3] === evForwarded);
 }
 
 /** bootstrap reports a hello or a dictionary list ([3, 0, 2|5, …]): they carry what the receiver

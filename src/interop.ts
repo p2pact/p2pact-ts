@@ -18,6 +18,11 @@
 // Kinds, named tools, grants, wants, the local socket and hosted tools: "kind", "peer-info", "tool",
 // "call-tool", "grant", "set-grants", "grants", "emit", "events", "on-wants", "local", "plugin-env", "proxy" and
 // join with "wants" (see p2pact-go/cmd/p2pact-interop for their JSON).
+// Via a third device (spec §3):
+//   {"cmd":"hide"}                                            → {"ok":true}  (announce no addresses)
+//   {"cmd":"forward","a":"…","b":"…","on":true|false}         → {"ok":true}
+//   {"cmd":"paths","peer":"…"}                                → {"paths":["udp","via:<forwarder>",…]}
+//   {"cmd":"forward-stats"}                                   → {"forwarded":N,"dropped":N}
 // Errors: {"error":"…"}.
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -190,6 +195,20 @@ for await (const line of createInterface({ input: process.stdin })) {
         say({ ok: true });
         break;
       }
+      case "hide": // announce no addresses: known devices reach us over roads they have, or a forwarder
+        node.setAdvertise({});
+        say({ ok: true });
+        break;
+      case "forward":
+        node.allowForward(req.a, req.b, !!req.on);
+        say({ ok: true });
+        break;
+      case "paths":
+        say({ paths: node.paths(req.peer) });
+        break;
+      case "forward-stats":
+        say(node.forwardStats());
+        break;
       case "close":
         node.close();
         process.exit(0);

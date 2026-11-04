@@ -81,6 +81,9 @@ export interface Peer {
   granted?: Grant[];
   /** we reach the device over our local socket (a plugin's host, spec §3) */
   local?: boolean;
+  /** the devices we forward to for this one (spec §3, Node.allowForward); the consent is for the
+   * pair, so each of the two lists the other */
+  forward?: string[];
 }
 
 /** allowed is what we let the device use of ours (spec §8.1); the default if never set. */
@@ -135,6 +138,7 @@ export class Trust {
           grants: Array.isArray(j.grants) ? cleanGrants(j.grants as Grant[]) : undefined,
           granted: Array.isArray(j.granted) ? cleanGrants(j.granted as Grant[]) : undefined,
           local: j.local ? true : undefined,
+          forward: Array.isArray(j.forward) && j.forward.length ? (j.forward as string[]).filter((a) => typeof a === "string") : undefined,
         };
         if (p.key.length === 32 && address(p.key) === p.addr) this.peers.set(p.addr, p);
       }
@@ -197,8 +201,23 @@ export class Trust {
 
   remove(addr: string): boolean {
     const had = this.peers.delete(addr);
-    if (had) this.save();
-    return had;
+    if (!had) return false;
+    for (const p of this.peers.values()) { // forgetting a device withdraws forwarding to it
+      if (p.forward?.includes(addr)) {
+        const l = p.forward.filter((a) => a !== addr);
+        p.forward = l.length ? l : undefined;
+      }
+    }
+    this.save();
+    return true;
+  }
+
+  /** setForward stores the devices we forward to for a known device. */
+  setForward(addr: string, list: string[]) {
+    const p = this.peers.get(addr);
+    if (!p) return;
+    p.forward = list.length ? [...list] : undefined;
+    this.save();
   }
 
   private save() {
@@ -207,6 +226,7 @@ export class Trust {
       ...(p.signKey ? { sign_key: b64(p.signKey) } : {}), ...(p.os ? { os: p.os } : {}), ...(p.via ? { via: p.via } : {}),
       ...(p.kind ? { kind: p.kind } : {}), ...(p.grants ? { grants: p.grants } : {}),
       ...(p.granted ? { granted: p.granted } : {}), ...(p.local ? { local: true } : {}),
+      ...(p.forward?.length ? { forward: p.forward } : {}),
     }));
     writeText(this.st, "net-peers.json", JSON.stringify(list, null, 2));
   }
