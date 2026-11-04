@@ -8,7 +8,7 @@ import { Dict, DictStore, dictId, frameCompress, frameDecompress, has, type Code
 import { address, equal, hex, randomBytes } from "./crypto.js";
 import { dataHeader, keepalive, msgMax, Stream, type StreamId } from "./delivery.js";
 import { cleanGrants, defaultGrants, grantLevel, grantsWire, LevelRead, LevelWrite, parseGrants, type Grant } from "./grants.js";
-import { FirstNamedTool, fixedTools, validToolName, type ToolRef } from "./tools.js";
+import { FirstNamedTool, fixedTool, fixedTools, validToolName, type ToolRef } from "./tools.js";
 import { CipherState, concat, Handshake } from "./noise.js";
 import { endpointKey, type AddrRoad, type Endpoint, type Road } from "./roads.js";
 import { WsRelayRoad, type WebSocketCtor } from "./relay-ws.js";
@@ -135,6 +135,7 @@ interface PeerState {
   askedInfo: number; // when we asked
   tried: Uint8Array[]; // dictionaries of its list we asked it for and did not get
   named?: Map<string, ToolRef>; // its named tools, from its hello (spec §8)
+  fixed?: Map<number, number>; // its tools of the spec, {tool: version} from its hello; undefined — no hello yet
   sysCalls: Set<number>; // our calls of tool 0: their results are not conversation
   inbox: Map<StreamId, (() => Promise<void> | void)[]>; // calls and events waiting for their turn, per stream
   forwards: string[]; // the devices it forwards to for us, from its hello (spec §3)
@@ -281,6 +282,7 @@ export class Node {
   private names = new Map<string, number>();
   private numbers = new Map<number, string>();
   private versions = new Map<number, number>();
+  private aliases = new Map<string, string>(); // aliasTool: a former name → the tool's name now
   private resetAt = new Map<string, number>();
   private dicts: DictStore;
   private learner?: DictLearner;
@@ -418,7 +420,66 @@ export class Node {
   /** level is the level a device has on one of our tools, by name. */
   level(peer: string, tool: string): number {
     const p = this.trust.get(peer);
-    return p ? grantLevel(p.grants, tool) : 0;
+    return p ? this.levelIn(p.grants, tool) : 0;
+  }
+
+  /** levelIn is the level a list of grants gives on a tool, counting its aliases ({@link aliasTool}):
+   * {@link grantLevel} for a tool known by more than one name. */
+  levelIn(grants: Grant[] | undefined, tool: string): number {
+    let level = 0;
+    for (const nm of this.toolNames(tool)) level = Math.max(level, grantLevel(grants, nm));
+    return level;
+  }
+
+  /** toolNames is a tool name with its aliases: the tool's name now first, then its former ones. */
+  private toolNames(name: string): string[] {
+    const c = this.aliases.get(name);
+    if (c !== undefined) name = c;
+    const out = [name];
+    for (const [a, canon] of this.aliases) if (canon === name) out.push(a);
+    return out;
+  }
+
+  /** aliasTool declares alias a former name of the tool canonical (spec §8.1): a device may serve
+   * one tool under both names, the name of the spec (say "p2pact.term", tool 5) and the one it
+   * had before (say "dev.nomadcode.term", a named tool from 64 up). Grants on either name count
+   * for both: a call or an event of either gets the highest level granted on any of them
+   * ({@link levelIn}). It is also what {@link callTool} by canonical falls back to on a device
+   * that announces only the alias. The alias is served as any named tool: register its handlers
+   * ({@link handleToolAll}, {@link handleTool}) — the same as canonical's — and answer and send
+   * events under the number it was called by. */
+  aliasTool(alias: string, canonical: string): void {
+    if (!validToolName(alias)) throw new Error("bad alias: " + alias);
+    if (fixedTool(canonical) === undefined && !validToolName(canonical)) throw new Error("bad tool name: " + canonical);
+    canonical = this.aliases.get(canonical) ?? canonical; // an alias of an alias names the same tool
+    if (alias === canonical) throw new Error("a tool is not its own alias: " + alias);
+    this.aliases.set(alias, canonical);
+  }
+
+  /** peerHasTool reports whether a device announced the tool in its last hello: a tool of the spec
+   * in its {tool: version}, a named one in its named map. false before its hello. */
+  peerHasTool(peer: string, name: string): boolean {
+    const ps = this.peers.get(peer);
+    if (!ps) return false;
+    const num = fixedTool(name);
+    if (num !== undefined) return ps.fixed?.has(num) ?? false;
+    return ps.named?.has(name) ?? false;
+  }
+
+  /** resolveTool is the number to call a tool on a device by, and the name it goes under there:
+   * the name itself if the device announced it, else an alias of it ({@link aliasTool}) the device
+   * announced — a device that knows the tool only by its former name — else, for a tool of the
+   * spec, its fixed number (the hello has not come, or does not list the tool). undefined — a
+   * named tool the device has not announced under any of its names. */
+  resolveTool(peer: string, name: string): { number: number; called: string } | undefined {
+    const names = [name, ...this.toolNames(name).filter((s) => s !== name)];
+    for (const nm of names) {
+      if (!this.peerHasTool(peer, nm)) continue;
+      const num = fixedTool(nm) ?? this.peers.get(peer)?.named?.get(nm)?.number;
+      if (num !== undefined) return { number: num, called: nm };
+    }
+    const num = fixedTool(name);
+    return num === undefined ? undefined : { number: num, called: name };
   }
 
   /** setGrants replaces what a trusted device may use (an empty list revokes everything), keeps
@@ -529,27 +590,39 @@ export class Node {
 
   /** callToolOn is {@link callOn} by tool name. */
   callToolOn(peer: string, stream: StreamId, name: string, method: number, ...args: unknown[]): Promise<Uint8Array[]> {
-    const num = this.toolNumber(peer, name);
-    if (num === undefined) return Promise.reject(new P2PACTError(ErrNoMethod, "the device has no tool " + name));
-    return this.callOn(peer, stream, num, method, ...args);
+    const r = this.resolveTool(peer, name);
+    if (r === undefined) return Promise.reject(new P2PACTError(ErrNoMethod, "the device has no tool " + name));
+    return this.callOn(peer, stream, r.number, method, ...args);
   }
 
   /** handleToolAll serves every method of the named tool with h (the tool is registered at
    * version 1 if it is not yet). The node only requires read on the tool; what each method needs
    * is for h to check. Methods registered one by one with {@link handle} keep their own handlers.
-   * For a device that hosts another program's tool (spec §8.2). */
+   * For a device that hosts another program's tool (spec §8.2), or one that serves a tool of the
+   * spec (a name of {@link fixedTools}, such as "p2pact.term") itself: it is announced under its
+   * fixed number. */
   handleToolAll(name: string, h: ToolHandler) {
-    this.toolHandlers.set(this.registerTool(name, 1), h);
+    const fixed = fixedTool(name);
+    if (fixed === undefined) {
+      this.toolHandlers.set(this.registerTool(name, 1), h);
+      return;
+    }
+    this.toolHandlers.set(fixed, h);
+    this.reannounceTools();
   }
 
-  /** unregisterTool takes a named tool back: it leaves the hello (sent again to the devices in
-   * session) and its handlers are dropped. Registering the name again may give another number. */
+  /** unregisterTool takes a tool back: it leaves the hello (sent again to the devices in session)
+   * and its handlers are dropped. Registering a name again may give another number. For a tool of
+   * the spec, its handlers are dropped and it leaves the hello. */
   unregisterTool(name: string) {
-    const num = this.names.get(name);
+    const fixed = fixedTool(name);
+    const num = fixed !== undefined && fixed !== 0 ? fixed : this.names.get(name);
     if (num === undefined) return;
-    this.names.delete(name);
-    this.numbers.delete(num);
-    this.versions.delete(num);
+    if (fixed === undefined) {
+      this.names.delete(name);
+      this.numbers.delete(num);
+      this.versions.delete(num);
+    }
     this.toolHandlers.delete(num);
     for (const m of [this.handlers, this.levelHandlers]) for (const k of [...m.keys()]) if (Number(k.split(".")[0]) === num) m.delete(k);
     for (const k of [...this.readMethods]) if (Number(k.split(".")[0]) === num) this.readMethods.delete(k);
@@ -708,7 +781,7 @@ export class Node {
     const ps = this.peerState(peer);
     if (!ps) throw new Error("unknown device");
     // a tool's events go only to devices with at least read on it (spec §8.1)
-    if (tool !== 0 && grantLevel(this.trust.get(peer)?.grants, this.toolName(tool)) < LevelRead) return;
+    if (tool !== 0 && this.levelIn(this.trust.get(peer)?.grants, this.toolName(tool)) < LevelRead) return;
     this.push(ps, encode([3, tool, ev, ...args]), stream, tool !== 0);
   }
 
@@ -728,6 +801,7 @@ export class Node {
       const t = Number(k.split(".")[0]);
       if (t !== 0 && !this.numbers.has(t)) tools.set(t, 1);
     }
+    for (const t of this.toolHandlers.keys()) if (t !== 0 && !this.numbers.has(t)) tools.set(t, 1); // a tool of the spec served by one handler
     const info: CborValue[] = [this.name, goos(), "p2pact-ts", tools, this.dicts.ids(peer), hintsToWire(this.hints()), this.kind, this.namedMap()];
     const fw = this.forwardsWire(peer); // whom we forward to for it (spec §3)
     if (fw.length) info.push(fw);
@@ -1238,7 +1312,7 @@ export class Node {
       let h: Handler | undefined = this.handlers.get(key);
       let level = 0, forbidden = false;
       if (tool !== 0) { // grants (spec §8.1): tool 0 is always allowed
-        level = grantLevel(this.trust.get(peer)?.grants, this.toolName(tool as number));
+        level = this.levelIn(this.trust.get(peer)?.grants, this.toolName(tool as number));
         forbidden = level < this.requiredLevel(tool as number, method as number);
       }
       const lh = this.levelHandlers.get(key);
@@ -1296,6 +1370,7 @@ export class Node {
           const kind = decode(a[9]);
           if (typeof kind === "number") this.trust.setKind(peer, kind);
         }
+        ps.fixed = parseFixed(decode(a[6]));
         ps.named = undefined;
         if (a.length >= 11) ps.named = parseNamed(decode(a[10]));
         ps.dicts = idsOf(decode(a[7]));
@@ -1892,6 +1967,13 @@ function parseNamed(v: CborValue): Map<string, ToolRef> | undefined {
       out.set(name, { number: r[0], version: r[1] });
     }
   }
+  return out;
+}
+
+/** parseFixed reads the hello's {tool: version}; an empty map when it is not one. */
+function parseFixed(v: CborValue): Map<number, number> {
+  const out = new Map<number, number>();
+  if (v instanceof Map) for (const [t, ver] of v) if (typeof t === "number") out.set(t, typeof ver === "number" ? ver : 1);
   return out;
 }
 

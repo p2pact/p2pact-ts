@@ -1,7 +1,7 @@
 // P2pactClient: an application's side of P2PACT (as the p2pact-kotlin client SDK).
 import { decode, type CborValue } from "../cbor.js";
 import type { StreamId } from "../delivery.js";
-import { grantLevel, LevelRead, LevelWrite, type Grant } from "../grants.js";
+import { LevelRead, LevelWrite, type Grant } from "../grants.js";
 import { ErrForbidden, KindClient, KindPlugin, later, Node, P2PACTError } from "../node.js";
 import type { Peer } from "../store.js";
 import { Invite } from "../store.js";
@@ -267,9 +267,10 @@ export class Computer {
     return this.node.grantedBy(this.id);
   }
 
-  /** The level we have on a tool of the computer: 0 none, 1 LevelRead, 2 LevelWrite. */
+  /** The level we have on a tool of the computer: 0 none, 1 LevelRead, 2 LevelWrite. Grants on a
+   * former name of the tool count (`node.aliasTool`). */
   level(tool: string): number {
-    return grantLevel(this.grants, tool);
+    return this.node.levelIn(this.grants, tool);
   }
 
   canRead(tool: string) {
@@ -337,11 +338,13 @@ export class Computer {
   }
 
   /** callTool calls a method of a tool by name; the number is the computer's own (hosted tools,
-   * core spec §8.2). It waits for the computer's hello if it has not come. Arguments are JSON
+   * core spec §8.2). A tool of the spec the computer does not announce goes by a former name of it the
+   * computer does announce (`node.aliasTool`): "p2pact.term" reaches an older computer that named its
+   * terminal itself. It waits for the computer's hello if it has not come. Arguments are JSON
    * trees (numbers, text, lists, maps, bytes); the result values are decoded CBOR as they are. */
   async callTool(name: string, method: number, ...args: unknown[]): Promise<CborValue[]> {
     const go = async () => {
-      const n = this.toolNumber(name);
+      const n = this.node.resolveTool(this.id, name)?.number;
       if (n === undefined) throw new NoMethodError(`the computer has no tool ${name}`);
       try {
         const res = await withTimeout(this.node.callOn(this.id, 0, n, method, ...args), this.owner.config.callTimeoutMs, name);
@@ -350,7 +353,7 @@ export class Computer {
         throw typed(e);
       }
     };
-    if (this.toolNumber(name) !== undefined || this.helloSeen) return go();
+    if (this.node.peerHasTool(this.id, name) || this.helloSeen) return go();
     // the hello may still be on its way after pairing
     const limit = this.owner.config.callTimeoutMs || 10_000;
     await withTimeout(this.ready.promise, limit, "hello").catch(() => {});

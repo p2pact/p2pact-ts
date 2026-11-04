@@ -10,7 +10,7 @@ export { address } from "./crypto.js";
 export { Dict, dictId, type Codec } from "./compress.js";
 export { zlibCodec } from "./compress-node.js";
 export { commonDict } from "./common.js";
-export { validToolName, FirstNamedTool, fixedTools, type ToolRef } from "./tools.js";
+export { validToolName, FirstNamedTool, fixedTools, fixedTool, type ToolRef } from "./tools.js";
 export { LevelRead, LevelWrite, AllTools, defaultGrants, grantLevel, type Grant } from "./grants.js";
 export type { StreamId } from "./delivery.js";
 export { LocalRoad } from "./local.js";

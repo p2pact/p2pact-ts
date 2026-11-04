@@ -5,6 +5,11 @@ export const Tools = {
   CHAT: "p2pact.chat",
   FLEET: "p2pact.fleet",
   PLUGINS: "p2pact.plugins",
+  /** The terminal (tool 5, spec term.md): no typed client; call it with `Computer.callTool`. A
+   * computer that knows it by a former name still answers once `node.aliasTool(former, TERM)`
+   * is declared. */
+  TERM: "p2pact.term",
+  TERM_NUMBER: 5,
   CHAT_NUMBER: 1,
   FLEET_NUMBER: 2,
   PLUGINS_NUMBER: 4,

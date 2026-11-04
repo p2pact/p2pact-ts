@@ -8,7 +8,14 @@ export const fixedTools: Readonly<Record<string, number>> = {
   "p2pact.fleet": 2,
   "p2pact.family": 3,
   "p2pact.plugins": 4,
+  "p2pact.term": 5,
 };
+
+/** fixedTool is the number the spec gives a tool name (§8): 0–63, the same on every device.
+ * undefined — the name is not one of the spec's. */
+export function fixedTool(name: string): number | undefined {
+  return Object.hasOwn(fixedTools, name) ? fixedTools[name] : undefined;
+}
 
 /** FirstNamedTool is the first number a device may choose for a named tool (spec §8). */
 export const FirstNamedTool = 64;
