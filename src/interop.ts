@@ -3,6 +3,7 @@
 // stdout. Every implementation ships one, so any two can be tested against each other.
 //
 //   {"cmd":"listen","udp":"127.0.0.1:0","tcp":"127.0.0.1:0"}  → {"addr":"…","udp":"…","tcp":"…"}
+//   {"cmd":"relay","addr":"host:port","fp":"hex","ws":["ws://…"]} → {"ok":true}  (say it before "invite")
 //   {"cmd":"invite"}                                          → {"invite":"p2pact1.…"}
 //   {"cmd":"join","invite":"…"}                               → {"peer":"…"}
 //   {"cmd":"known","peer":"…"}                                → {"known":true|false}
@@ -76,6 +77,10 @@ for await (const line of createInterface({ input: process.stdin })) {
         if (req.udp) await node.listenUDP(req.udp);
         if (req.tcp !== undefined) await node.listenTCP(req.tcp);
         say({ addr: node.id.addr, udp: node.udpRoad?.localAddr() ?? "", tcp: node.tcpRoad?.localAddr() ?? "" });
+        break;
+      case "relay": // the relay as a WebSocket device dials it: the ws URLs (addr and fp are the TLS road, which this peer does not have)
+        node.setRelay(req.ws ?? []);
+        say({ ok: true });
         break;
       case "invite":
         say({ invite: node.invite(600_000).toString() });
