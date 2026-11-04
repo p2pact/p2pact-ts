@@ -23,6 +23,8 @@ export interface InitializeResult {
   agents: AgentInfo[];
   /** The computer speaks the `_p2pact/<name>` extensions. */
   extensions: boolean;
+  /** The extension level the computer speaks (`_meta.p2pact.v`): 2 and up answers `_p2pact/*` complete; 0 if it does not say. */
+  level: number;
   raw: JsonMap;
 }
 
@@ -37,6 +39,7 @@ export function parseInitialize(m: JsonMap): InitializeResult {
     loadSession: bool(obj(m, "agentCapabilities") ?? {}, "loadSession") ?? false,
     agents: objs(meta, "agents").map(parseAgent),
     extensions: (num(meta, "ext") ?? 0) >= 1,
+    level: num(meta, "v") ?? 0,
     raw: m,
   };
 }
@@ -189,6 +192,8 @@ export interface OlderPage {
   sessionId: string;
   messages: ChatMessage[];
   more: boolean;
+  /** The id of the run the page belongs to, when the engine says. */
+  run?: string;
   raw: JsonMap;
 }
 
@@ -209,10 +214,101 @@ export interface DiffResult {
 }
 
 export interface ImageResult {
+  /** The path asked for. */
+  path?: string;
+  /** The type of the bytes, e.g. `image/png`. */
+  mime?: string;
   /** Base64. */
   data?: string;
   /** `not_found`, `no_file`, `too_big`, `bad_image`. */
   error?: string;
+  raw: JsonMap;
+}
+
+/** An argument suggestion of a slash command. */
+export interface CommandArg {
+  value: string;
+  desc?: string;
+}
+
+/** A slash command of the chat's agent (`_p2pact/commands`). */
+export interface ChatCommand {
+  name: string;
+  desc?: string;
+  hint?: string;
+  args: CommandArg[];
+}
+
+export interface FilesResult {
+  /** Paths relative to the chat's folder (up to 50). */
+  files: string[];
+  query: string;
+  raw: JsonMap;
+}
+
+/** A closed conversation of `_p2pact/history`. */
+export interface HistoryItem {
+  id: string;
+  agent: string;
+  dir: string;
+  project?: string;
+  title: string;
+  /** Unix milliseconds. */
+  updated: number;
+  count?: number;
+  /** The conversation is in `session/list` now. */
+  open?: boolean;
+}
+
+export interface HistoryPage {
+  items: HistoryItem[];
+  query: string;
+  from: number;
+  total: number;
+  /** The `offset` of the next page; absent on the last. */
+  cursor?: number;
+  partial?: boolean;
+  raw: JsonMap;
+}
+
+export interface ProjectsResult {
+  dirs: string[];
+  /** Project name to its folders. */
+  projectDirs: Record<string, string[]>;
+  /** Folder to its git remote. */
+  dirRepos: Record<string, string>;
+  raw: JsonMap;
+}
+
+/** An agent the computer can start (`_p2pact/agents`). */
+export interface AgentOffer {
+  id: string;
+  name: string;
+  type: string;
+  enabled: boolean;
+  models: string[];
+  default?: string;
+}
+
+/** A ready-made choice (agent plus model); the first is the main one. */
+export interface AgentPreset {
+  id: string;
+  name: string;
+  raw: JsonMap;
+}
+
+export interface AgentsResult {
+  agents: AgentOffer[];
+  presets: AgentPreset[];
+  raw: JsonMap;
+}
+
+/** The answer of close, restart, hide and history_open. */
+export interface OkResult {
+  ok: boolean;
+  error?: string;
+  /** The phone lines of the result (`cmd`), e.g. an `alert` the person should see. */
+  lines: JsonMap[];
   raw: JsonMap;
 }
 

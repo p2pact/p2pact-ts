@@ -7,6 +7,7 @@ import {
 } from "../src/client/index.js";
 import { typed } from "../src/client/errors.js";
 import { P2PACTError } from "../src/index.js";
+import { str } from "../src/client/support.js";
 import { Fixtures, Harness } from "./client-util.js";
 
 /** run starts a harness, runs the body and closes everything. */
@@ -235,6 +236,81 @@ test("extensions", () => run(async (h) => {
   sentIs(h, "_p2pact/image", "_p2pact.image.request");
   assert.equal(image.error, "not_found");
   assert.equal(image.data, undefined);
+}));
+
+/** The fixture's answer as an engine older than the typed results sends it: only `lines`. */
+const legacy = (name: string): JsonMap => {
+  const m = Fixtures.read("p2pact.chat", name + ".response");
+  return { jsonrpc: "2.0", result: { lines: (m.result as JsonMap).lines } };
+};
+
+for (const form of ["typed", "legacy"]) {
+  test(`typed extension methods, ${form} result`, () => run(async (h) => {
+    const chat = (await h.connect()).chat;
+    if (form === "legacy") {
+      for (const n of ["older", "commands", "files", "history", "projects", "agents", "image", "diff", "close", "restart", "hide", "history_open"]) {
+        h.engine.overrides.set(`1:_p2pact/${n}`, () => legacy("_p2pact." + n));
+      }
+    }
+    // the fake serves one image fixture per method: pick by the path asked
+    h.engine.overrides.set("1:_p2pact/image", (p) => {
+      const n = str(p, "path") === "/w/proj/ok.png" ? "_p2pact.image.data" : "_p2pact.image";
+      return form === "legacy" ? legacy(n) : Fixtures.read("p2pact.chat", n + ".response");
+    });
+    await chat.initialize();
+    sentIs(h, "initialize", "initialize.request");
+    assert.equal(((h.sent(1, "initialize")._meta as JsonMap).p2pact as JsonMap).v, 2);
+
+    const older = await chat.older("s1", 3);
+    assert.deepEqual([older.messages.map((m) => m.text), older.more, older.run], [["привет"], false, "r1"]);
+
+    const commands = await chat.commands("s1");
+    sentIs(h, "_p2pact/commands", "_p2pact.commands.request");
+    assert.deepEqual(commands, [{ name: "review", desc: "Review the changes", hint: "<pr>", args: [{ value: "main", desc: "base branch" }] }]);
+
+    const files = await chat.files("s1", "fac");
+    sentIs(h, "_p2pact/files", "_p2pact.files.request");
+    assert.deepEqual([files.files, files.query], [["agent/pkg/acpchat/facade.go"], "fac"]);
+
+    const hist = await chat.history("", 0);
+    sentIs(h, "_p2pact/history", "_p2pact.history.request");
+    assert.deepEqual([hist.items.map((i) => [i.id, i.agent, i.dir, i.title, i.updated, i.count]), hist.from, hist.total, hist.cursor, hist.partial],
+      [[["h1", "claude", "/w/proj", "Fix the build", 1793700000000, 12]], 0, 2, form === "typed" ? 1 : undefined, undefined]);
+
+    const projects = await chat.projects("/w/proj");
+    sentIs(h, "_p2pact/projects", "_p2pact.projects.request");
+    assert.deepEqual([projects.dirs, projects.projectDirs, projects.dirRepos],
+      [["/w/proj"], { proj: ["/w/proj", "/w/proj-api"] }, { "/w/proj": "git@example.com:team/proj.git" }]);
+
+    const agents = await chat.agents();
+    assert.deepEqual(agents.agents, [{ id: "claude", name: "Claude Code", type: "claude", enabled: true, models: ["opus", "sonnet"], default: "sonnet" }]);
+    assert.deepEqual(agents.presets.map((p) => [p.id, p.name]), [["p1", "Claude Sonnet"]]);
+
+    const ok = await chat.image("s1", "/w/proj/ok.png");
+    sentIs(h, "_p2pact/image", "_p2pact.image.data.request");
+    assert.deepEqual([ok.mime, ok.error, ok.data?.startsWith("iVBOR")], form === "typed" ? ["image/png", undefined, true] : [undefined, undefined, true]);
+    const bad = await chat.image("s1", "/w/proj/shot.png");
+    assert.deepEqual([bad.error, bad.data, bad.path], ["not_found", undefined, "/w/proj/shot.png"]);
+
+    const diff = await chat.diff("s1");
+    assert.deepEqual([diff.files, diff.patch, diff.truncated], [[{ path: "a.go", added: 3, removed: 1, status: "M" }], "diff --git a/a.go b/a.go\n", false]);
+
+    for (const r of [await chat.close("s1"), await chat.restart("s1"), await chat.hide("s1", false), await chat.historyOpen("h1")]) {
+      assert.deepEqual([r.ok, r.error], [true, undefined]);
+    }
+    sentIs(h, "_p2pact/history_open", "_p2pact.history_open.request");
+    assert.deepEqual(h.sent(1, "_p2pact/hide"), { sessionId: "s1", on: false });
+  }));
+}
+
+test("a failed write reports ok false", () => run(async (h) => {
+  const chat = (await h.connect()).chat;
+  h.engine.overrides.set("1:_p2pact/restart", () => ({ jsonrpc: "2.0", result: { ok: false, error: "not ours", lines: [] } }));
+  h.engine.overrides.set("1:_p2pact/close", () => ({ jsonrpc: "2.0", result: { lines: [{ cmd: "alert", id: "s1", text: "boom" }] } }));
+  const r = await chat.restart("s1");
+  assert.deepEqual([r.ok, r.error], [false, "not ours"]);
+  const c = await chat.close("s1");
+  assert.deepEqual([c.ok, c.error], [false, "boom"]);
 }));
 
 test("late reports", () => run(async (h) => {

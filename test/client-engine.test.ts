@@ -1,4 +1,4 @@
-// The client SDK against the real Nomad Code engine (Go, `agent/cmd/nomadcode`, TestAppE2E): the
+// The client SDK against the real Nomad Code engine (Go, `agent/engine`, TestAppE2E): the
 // engine runs as a `go test` process on 127.0.0.1 with a random port, nothing of the user's engine
 // is touched. Only with P2PACT_ENGINE_E2E=<path to nomad-code/agent> (Go is needed).
 //
@@ -25,7 +25,7 @@ class Engine {
   private exited: Promise<number | null>;
 
   constructor(decide: string) {
-    this.proc = spawn("go", ["test", "-count=1", "-v", "-run", "^TestAppE2E$", "./cmd/nomadcode"], {
+    this.proc = spawn("go", ["test", "-count=1", "-v", "-run", "^TestAppE2E$", "./engine"], {
       cwd: agent,
       env: { ...process.env, NOMAD_APP_E2E: this.dir, NOMAD_APP_E2E_DECIDE: decide },
     });
@@ -83,6 +83,15 @@ test("an app against the engine", { skip, timeout: 240_000 }, async () => {
     const loaded = await chat.loadSession("s1");
     const texts = loaded.updates.flatMap((u) => (u.type === "user_message" ? ["u:" + u.text] : u.type === "agent_message" ? ["a:" + u.text] : []));
     assert.ok(texts.includes("u:привет") && texts.includes("a:Готово"), texts.join(","));
+
+    // typed extension results (initialize sent v: 2): complete, not only the old lines
+    assert.equal((await chat.initialize()).level >= 2, true);
+    const offered = await chat.agents();
+    assert.ok(Array.isArray(offered.raw.agents) && Array.isArray(offered.raw.lines), "typed agents next to lines");
+    const projects = await chat.projects();
+    assert.ok(Array.isArray(projects.raw.dirs) && projects.dirs.length >= 0);
+    const found = await chat.files("s1", "");
+    assert.ok(Array.isArray(found.raw.files) && found.query === "");
 
     // fleet: read
     const fleet = computer.fleet;

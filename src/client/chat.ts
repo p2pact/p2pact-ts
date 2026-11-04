@@ -5,14 +5,14 @@ import { decode } from "../cbor.js";
 import type { StreamId } from "../delivery.js";
 import {
   parseInitialize, parseMessage, parseSession, parseUpdate, parseToolCall, textBlock, PermissionRequest, QuestionRequest,
-  type ChatMessage, type ChatSession, type ChatUpdate, type DiffResult, type ImageResult, type InitializeResult, type LoadedSession,
+  type AgentsResult, type ChatCommand, type ChatMessage, type ChatSession, type FilesResult, type HistoryItem, type HistoryPage, type OkResult, type ProjectsResult, type ChatUpdate, type DiffResult, type ImageResult, type InitializeResult, type LoadedSession,
   type NewSession, type OlderPage, type PermissionHandler, type PermissionOutcome, type PromptResult, type QuestionHandler,
   type RequestAnswered, type SessionList,
 } from "./chat-models.js";
 import type { Computer } from "./client.js";
 import { FailedError, RpcError } from "./errors.js";
 import { Tools } from "./names.js";
-import { afterEvents, asMap, deferred, bool, Events, normalize, num, obj, objs, p2pactMeta, str, streamOf, wire, type JsonMap } from "./support.js";
+import { afterEvents, asMap, deferred, bool, Events, normalize, num, obj, objs, p2pactMeta, str, streamOf, strings, wire, type JsonMap } from "./support.js";
 
 /**
  * ChatClient is tool 1 `p2pact.chat` of one computer. Methods that read need level 1 on the
@@ -58,9 +58,9 @@ export class ChatClient {
   // --- connection ---
 
   /** initialize says hello to the computer's chat: capabilities, the agents it offers. It also asks
-   * for the extension notifications (`_meta.p2pact.ext: 1`). The other calls do it for you. */
+   * for the extension notifications (`_meta.p2pact.ext: 1`) and complete extension results (`v: 2`). The other calls do it for you. */
   initialize(): Promise<InitializeResult> {
-    const params = { protocolVersion: 1, clientCapabilities: {}, _meta: { p2pact: { ext: 1 } } };
+    const params = { protocolVersion: 1, clientCapabilities: {}, _meta: { p2pact: { ext: 1, v: 2 } } };
     const p = this.computer.rpc(Tools.CHAT_NUMBER, "initialize", params).then((r) => (this.initResult = parseInitialize(r)));
     this.initialized = p;
     p.catch(() => {
@@ -167,44 +167,132 @@ export class ChatClient {
   /** command calls `_p2pact/<name>` and gives its lines (§9.3): JSON objects with `cmd`. Lines that
    * come later arrive in `reports`. A failure the person should see is the line `{"cmd":"alert"}`. */
   async command(name: string, params: JsonMap = {}): Promise<JsonMap[]> {
-    return objs(await this.settledCall(`_p2pact/${name}`, params, streamOf(str(params, "sessionId"))), "lines");
+    return objs(await this.extension(name, params), "lines");
+  }
+
+  /** extension is the whole result of `_p2pact/<name>`: the typed fields and `lines`. */
+  private extension(name: string, params: JsonMap): Promise<JsonMap> {
+    return this.settledCall(`_p2pact/${name}`, params, streamOf(str(params, "sessionId")));
+  }
+
+  /** The typed result when it has the field `key`; else (an engine older than the typed results) the
+   * line `cmd` of `lines`. Content an old engine sends later only (commands, agents, history without
+   * `v: 2`) is not waited for: it stays empty here and arrives in `reports`. */
+  private async typedOrLine(name: string, params: JsonMap, key: string, cmd = name): Promise<{ r: JsonMap; src: JsonMap }> {
+    const r = await this.extension(name, params);
+    if (Array.isArray(r[key])) return { r, src: r };
+    return { r, src: objs(r, "lines").find((x) => str(x, "cmd") === cmd) ?? {} };
+  }
+
+  private async okResult(name: string, params: JsonMap): Promise<OkResult> {
+    const r = await this.extension(name, params);
+    const lines = objs(r, "lines");
+    const error = str(r, "error") ?? str(lines.find((x) => str(x, "cmd") === "alert") ?? {}, "text");
+    // an older engine sends no `ok`: a failure is then the alert line
+    return { ok: bool(r, "ok") ?? error === undefined, error, lines, raw: r };
   }
 
   /** close closes the chat: it leaves the list. */
-  close(sessionId: string) {
-    return this.command("close", { sessionId });
+  close(sessionId: string): Promise<OkResult> {
+    return this.okResult("close", { sessionId });
   }
 
-  /** restart starts the agent of a chat again. */
-  restart(sessionId: string) {
-    return this.command("restart", { sessionId });
+  /** restart starts the agent of a chat again (only chats the computer runs itself). */
+  restart(sessionId: string): Promise<OkResult> {
+    return this.okResult("restart", { sessionId });
   }
 
   /** hide hides a chat from the list (on) or shows it again. */
-  hide(sessionId: string, on = true) {
-    return this.command("hide", { sessionId, on });
+  hide(sessionId: string, on = true): Promise<OkResult> {
+    return this.okResult("hide", { sessionId, on });
+  }
+
+  /** historyOpen is `_p2pact/history_open`: a closed conversation of `history()` (its `id`) comes back to the list as `closed`. */
+  historyOpen(sessionId: string): Promise<OkResult> {
+    return this.okResult("history_open", { sessionId });
   }
 
   /** older is `_p2pact/older`: the page of messages just before `before` (the `seq` of the oldest you have). */
   async older(sessionId: string, before: number): Promise<OlderPage> {
-    const l = (await this.command("older", { sessionId, before })).find((x) => str(x, "cmd") === "older") ?? {};
-    const messages: ChatMessage[] = objs(l, "messages").map(parseMessage);
-    return { sessionId, messages, more: bool(l, "more") ?? false, raw: l };
+    const { r, src } = await this.typedOrLine("older", { sessionId, before }, "messages");
+    const messages: ChatMessage[] = objs(src, "messages").map(parseMessage);
+    return { sessionId, messages, more: bool(src, "more") ?? false, run: str(src, "run"), raw: r };
+  }
+
+  /** commands is `_p2pact/commands`: the agent's slash commands of the chat, for completion. */
+  async commands(sessionId: string): Promise<ChatCommand[]> {
+    const { src } = await this.typedOrLine("commands", { sessionId }, "commands");
+    return objs(src, src.commands ? "commands" : "list").map((c) => ({
+      name: str(c, "name") ?? "", desc: str(c, "desc"), hint: str(c, "hint"),
+      args: objs(c, "args").map((a) => ({ value: str(a, "value") ?? "", desc: str(a, "desc") })),
+    }));
+  }
+
+  /** files is `_p2pact/files`: files of the chat's folder that match `query` (for `@file` completion). */
+  async files(sessionId: string, query: string): Promise<FilesResult> {
+    const { r, src } = await this.typedOrLine("files", { sessionId, query }, "files");
+    return { files: strings(src, src.files ? "files" : "list"), query: str(src, "query") ?? query, raw: r };
+  }
+
+  /** history is `_p2pact/history`: closed conversations of the computer's agents, newest first; `offset` is the `cursor` of the page before. */
+  async history(query = "", offset = 0): Promise<HistoryPage> {
+    const { r, src } = await this.typedOrLine("history", { query, offset }, "items", "history");
+    const items = objs(src, src.items ? "items" : "list").map((i): HistoryItem => ({
+      id: str(i, "id") ?? "", agent: str(i, "agent") ?? "", dir: str(i, "dir") ?? "", project: str(i, "project"),
+      title: str(i, "title") ?? "", updated: num(i, "updated") ?? 0, count: num(i, "count"), open: bool(i, "open"),
+    }));
+    return {
+      items, query: str(src, "query") ?? query, from: num(src, "from") ?? offset, total: num(src, "total") ?? items.length,
+      cursor: num(src, "cursor"), partial: bool(src, "partial"), raw: r,
+    };
+  }
+
+  /** projects is `_p2pact/projects`: folders to start a chat in; `cwd` is an extra folder to describe. */
+  async projects(cwd?: string): Promise<ProjectsResult> {
+    const { r, src } = await this.typedOrLine("projects", cwd === undefined ? {} : { cwd }, "dirs");
+    const dirs = obj(src, "project_dirs") ?? {};
+    const repos = obj(src, "dir_repos") ?? {};
+    return {
+      dirs: strings(src, "dirs"),
+      projectDirs: Object.fromEntries(Object.keys(dirs).map((k) => [k, strings(dirs, k)])),
+      dirRepos: Object.fromEntries(Object.entries(repos).filter((e): e is [string, string] => typeof e[1] === "string")),
+      raw: r,
+    };
+  }
+
+  /** agents is `_p2pact/agents`: the agents with the models they offer for `newSession`, and the ready-made presets. */
+  async agents(): Promise<AgentsResult> {
+    const r = await this.extension("agents", {});
+    const lines = objs(r, "lines");
+    const line = (cmd: string) => objs(lines.find((x) => str(x, "cmd") === cmd) ?? {}, "list");
+    const agents = Array.isArray(r.agents) ? objs(r, "agents") : line("agents");
+    const presets = Array.isArray(r.presets) ? objs(r, "presets") : line("presets");
+    return {
+      agents: agents.map((a) => ({
+        id: str(a, "id") ?? "", name: str(a, "name") ?? "", type: str(a, "type") ?? "", enabled: bool(a, "enabled") ?? false,
+        models: strings(a, "models"), default: str(a, "default"),
+      })),
+      presets: presets.map((p) => ({ id: str(p, "id") ?? "", name: str(p, "name") ?? "", raw: p })),
+      raw: r,
+    };
   }
 
   /** diff is `_p2pact/diff`: the changes in the chat's folder (git). */
   async diff(sessionId: string): Promise<DiffResult> {
-    const l = (await this.command("diff", { sessionId })).find((x) => str(x, "cmd") === "diff") ?? {};
+    const { r, src } = await this.typedOrLine("diff", { sessionId }, "files");
+    // `{error}` has no files: take the typed result when it carries an error
+    const l = str(r, "error") !== undefined ? r : src;
     return {
       files: objs(l, "files").map((f) => ({ path: str(f, "path") ?? "", added: num(f, "added") ?? 0, removed: num(f, "removed") ?? 0, status: str(f, "status") })),
-      patch: str(l, "patch") ?? "", truncated: bool(l, "truncated") ?? false, error: str(l, "error"), raw: l,
+      patch: str(l, "patch") ?? "", truncated: bool(l, "truncated") ?? false, error: str(l, "error"), raw: r,
     };
   }
 
   /** image is `_p2pact/image`: the bytes (base64) of an image a message points to. */
   async image(sessionId: string, path: string): Promise<ImageResult> {
-    const l = (await this.command("image", { sessionId, path })).find((x) => str(x, "cmd") === "image") ?? {};
-    return { data: str(l, "data"), error: str(l, "error"), raw: l };
+    const r = await this.extension("image", { sessionId, path });
+    const l = str(r, "data") !== undefined || str(r, "error") !== undefined ? r : objs(r, "lines").find((x) => str(x, "cmd") === "image") ?? {};
+    return { path: str(l, "path"), mime: str(l, "mime"), data: str(l, "data"), error: str(l, "error"), raw: r };
   }
 
   // --- from the computer ---
