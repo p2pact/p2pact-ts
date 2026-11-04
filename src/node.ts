@@ -278,6 +278,7 @@ export class Node {
     this.id = Identity.load(storage);
     this.trust = new Trust(storage);
     this.dicts = new DictStore(storage);
+    this.dicts.listedBy = (d) => has(this.peers.get(d.peer)?.dicts ?? [], d.id);
     this.codec = opts.codec;
     this.wsCtor = opts.WebSocket;
     this.learner = opts.learner?.(this.dicts, (d) => this.addDictLocal(d));
@@ -1355,8 +1356,12 @@ export class Node {
       const r = this.unzip(ps, w.msg, w.zip);
       if (r.missing) {
         const id = ps.dicts[w.msg[0] - 1];
-        if (id.length > 0) return void this.fetchDict(peer, ps, id, true);
-        ps.waiting.shift(); // a free slot: the message is damaged
+        if (id.length > 0) {
+          if (!has(ps.tried, id)) this.fetchDict(peer, ps, id); // one we could not get: unhold asks again, then drops
+          return;
+        }
+        ps.waiting.shift(); // a free slot: the sender dropped that dictionary, the message cannot be read
+        if (this.onHeld) queueMicrotask(() => this.onHeld!(peer, 1));
         continue;
       }
       if (r.noList) {
@@ -1446,12 +1451,12 @@ export class Node {
    * (the family's, say) is not asked for again until its list changes. */
   private fetchNew(peer: string, ps: PeerState) {
     const id = ps.dicts.find((id) => id.length > 0 && !this.dicts.get(id, peer) && !has(ps.tried, id));
-    if (id) this.fetchDict(peer, ps, id, false);
+    if (id) this.fetchDict(peer, ps, id);
   }
 
   /** fetchDict asks the device for dictionary id: one it compressed a waiting message with (it
    * has it), or a new one in its list. What we get belongs to the pair with it. */
-  private fetchDict(peer: string, ps: PeerState, id: Uint8Array, waiting: boolean) {
+  private fetchDict(peer: string, ps: PeerState, id: Uint8Array) {
     if (ps.fetching) return;
     ps.fetching = true;
     void (async () => {
@@ -1474,10 +1479,9 @@ export class Node {
           d = null; // could not store it: do not ask again and again
         }
       }
-      if (!d) {
-        if (waiting && ps.waiting.length > 0) ps.waiting.shift(); // the dictionary is unreachable: this message is lost
-        else ps.tried.push(id);
-      }
+      // not dropped at once even if a message waits for it: it stays held, unhold asks again
+      // after holdAsk and drops it after holdDrop, telling the application (onHeld)
+      if (!d) ps.tried.push(id);
       this.drain(peer, ps);
       this.fetchNew(peer, ps);
     })();

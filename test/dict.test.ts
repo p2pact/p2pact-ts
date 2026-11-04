@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { commonDict, decode, encode, ErrFailed, Invite, Node, P2PACTError } from "../src/index.js";
+import { commonDict, decode, encode, ErrFailed, ErrNotFound, Invite, Node, P2PACTError } from "../src/index.js";
 import { bootstrap, holdTiming } from "../src/node.js";
 import { Dict, DictStore } from "../src/compress.js";
 import { compress, decompress } from "../src/compress-node.js";
@@ -310,6 +310,69 @@ test("held messages are dropped", async () => {
     inside(b).peers.get(a.id.addr)!.dicts = []; // b lost a's list, and a will not tell it
     a.event(b.id.addr, 9, 1, longText);
     await waitFor("held messages were never dropped", () => held > 0, 10_000);
+  } finally {
+    Object.assign(holdTiming, old);
+    a.close();
+    b.close();
+  }
+});
+
+// The sender lists more dictionaries than the receiver keeps of one kind (a common one the
+// receiver lacks plus four of its own for the receiver: all five are the pair's on the
+// receiver). The receiver must keep what the sender lists instead of evicting one for another
+// and fetching it back forever, and messages compressed meanwhile must all run.
+test("listed dictionaries are kept", async () => {
+  const a = await node("Engine"), b = await node("CLI");
+  try {
+    a.noLearning = b.noLearning = true;
+    let asked = 0;
+    a.handle(0, 5, (peer, args) => {
+      asked++;
+      return (a as unknown as { dictHandler(p: string, a: Uint8Array[]): never }).dictHandler(peer, args);
+    });
+    await pair(a, b);
+    const got: string[] = [];
+    b.onEvent = (_p, _t, _e, args) => void got.push(decode(args[0]) as string);
+    const priv = a as unknown as { addDictLocal(d: Dict): void };
+    priv.addDictLocal(new Dict(testDict(0)));
+    for (let seed = 1; seed <= 4; seed++) priv.addDictLocal(new Dict(testDict(seed), b.id.addr, true));
+    for (let i = 0; i < 20; i++) a.event(b.id.addr, 9, 1, `${i} ${longText}`);
+    await sleep(2000);
+    assert.ok(asked <= 2 * 5, `b asked for dictionaries ${asked} times: it evicts what a still lists`);
+    const ps = (b as unknown as { peers: Map<string, { waiting: unknown[] }> }).peers.get(a.id.addr)!;
+    assert.equal(ps.waiting.length, 0, "messages still held");
+    assert.equal(b.dictIds(a.id.addr).filter((x) => x.length > 0).length, 5);
+    await waitFor(`got ${got.length} of 20 messages`, () => got.length === 20, 5000);
+  } finally {
+    a.close();
+    b.close();
+  }
+});
+
+// A message waits for a dictionary the sender cannot give: it is not dropped silently at the
+// first failed fetch, but held, asked for again and dropped after holdDrop with onHeld.
+test("held for an unreachable dictionary is reported", async () => {
+  const old = { ...holdTiming };
+  holdTiming.ask = 200;
+  holdTiming.drop = 1500;
+  const a = await node("Phone"), b = await node("Mac");
+  try {
+    await pairWithDict(a, b);
+    let asked = 0;
+    a.handle(0, 5, () => {
+      asked++;
+      throw new P2PACTError(ErrNotFound, "no such dictionary");
+    });
+    let held = 0;
+    const start = Date.now();
+    b.onHeld = (_peer, k) => (held = k);
+    const store = (b as unknown as { dicts: { dicts: Dict[]; gen: number } }).dicts;
+    store.dicts = []; // b lost the dictionary and a does not know
+    store.gen++;
+    a.event(b.id.addr, 9, 1, longText);
+    await waitFor("the held message was dropped silently or never", () => held > 0, 10_000);
+    assert.ok(Date.now() - start >= 200, `dropped after ${Date.now() - start} ms`);
+    assert.ok(asked >= 2, `asked for the dictionary ${asked} times: not asked again before dropping`);
   } finally {
     Object.assign(holdTiming, old);
     a.close();

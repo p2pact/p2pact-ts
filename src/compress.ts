@@ -110,6 +110,11 @@ export function restoreFrame(f: Uint8Array, zid: number): Uint8Array | null {
 // dictKeep is how many dictionaries of one kind to keep (common ones, ours for a device, a
 // device's own): new ones and those still in flight.
 const dictKeep = 4;
+// dictListedMax bounds the pair's dictionaries kept because the device still lists them: what a
+// device may list to another (its common ones, its own for it and the one it got from it).
+// Everything we fetch from a device is the pair's here, so its list can hold more than dictKeep
+// of that kind; evicting one it lists would only make us fetch it again, and again (spec §5).
+const dictListedMax = 3 * dictKeep;
 // slotsMax: past this many slots, a new dictionary takes the oldest empty one.
 const slotsMax = 32;
 
@@ -124,6 +129,8 @@ export class DictStore {
   private slots = new Map<string, Uint8Array[]>();
   private gen = 0; // bumped on every change of the dictionaries
   private cache = new Map<string, { gen: number; ids: Uint8Array[] }>();
+  /** listedBy: whether the device a pair's dictionary came from still lists it to us (unset: none is); kept past dictKeep, up to dictListedMax. */
+  listedBy?: (d: Dict) => boolean;
 
   constructor(private st: Storage) {
     const order = readText(st, "net-dicts/order");
@@ -151,10 +158,13 @@ export class DictStore {
     for (const x of this.dicts) {
       if (equal(x.id, d.id) && x.peer === d.peer) continue;
       const k = `${x.peer} ${x.own}`;
-      const n = (kinds.get(k) ?? 0) + 1;
-      kinds.set(k, n);
-      if (n > dictKeep) dropped.push(x);
-      else out.push(x);
+      const kept = kinds.get(k) ?? 0;
+      if (kept >= dictKeep && !(kept < dictListedMax && x.peer !== "" && !x.own && this.listedBy?.(x))) {
+        dropped.push(x);
+        continue;
+      }
+      kinds.set(k, kept + 1);
+      out.push(x);
     }
     for (const x of dropped) { // one file serves the same bytes kept as another kind
       if (!listed(out, x.id)) this.st.remove("net-dicts/" + hex(x.id));
